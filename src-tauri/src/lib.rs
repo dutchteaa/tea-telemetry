@@ -79,7 +79,6 @@ pub fn run() {
                 .rotation_strategy(RotationStrategy::KeepOne)
                 .build(),
         )
-        .plugin(tauri_plugin_opener::init())
         .setup(move |app| {
             let init = || -> anyhow::Result<AppState> {
                 let store = Store::open(&root)?;
