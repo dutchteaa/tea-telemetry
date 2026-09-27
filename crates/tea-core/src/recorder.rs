@@ -153,7 +153,10 @@ impl Recorder {
             (Some(_), prev) => {
                 let lap = self.lap.as_mut().expect("lap in progress");
                 if let Some(prev) = &prev {
-                    let jump = (f.get(Channel::LapDistPct) - prev.get(Channel::LapDistPct)).abs();
+                    // Distance around the lap circle, so a wrap a frame before or after
+                    // the Lap counter changes isn't mistaken for a teleport.
+                    let d = (f.get(Channel::LapDistPct) - prev.get(Channel::LapDistPct)).abs();
+                    let jump = d.min(1.0 - d);
                     if jump > TELEPORT_PCT {
                         lap.reset = true;
                     }
@@ -368,6 +371,25 @@ mod tests {
             }
         });
         assert_eq!(lap.invalid_reason, Some(InvalidReason::Reset));
+    }
+
+    #[test]
+    fn pct_wrap_a_frame_off_the_lap_increment_is_not_a_reset() {
+        // The line is crossed at t=1144.47: the frame at 1144.4 has pct 0.9947 and the
+        // frame at 1144.5 has pct 0.0047. The sim may bump Lap one frame late or early.
+        let run_with = |edit: &dyn Fn(&mut Frame)| {
+            let mut frames = drive(1, 0.5553, 250.0);
+            frames.iter_mut().for_each(|f| edit(f));
+            run(&mut Recorder::new(), with_session(frames, PollResult::Idle))
+        };
+        // Late: pct wraps while Lap still says 2.
+        let laps = run_with(&|f| if at(f, 144.45, 144.55) { f.lap = 2 });
+        let lap2 = laps.iter().find(|l| l.lap_number == 2).expect("lap 2");
+        assert_eq!(lap2.invalid_reason, None);
+        // Early: Lap says 3 while pct is still 0.9947.
+        let laps = run_with(&|f| if at(f, 144.35, 144.45) { f.lap = 3 });
+        let lap3 = laps.iter().find(|l| l.lap_number == 3).expect("lap 3");
+        assert_eq!(lap3.invalid_reason, None);
     }
 
     #[test]
