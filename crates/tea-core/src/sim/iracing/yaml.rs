@@ -179,6 +179,29 @@ pub fn parse(src: &str) -> Node {
     Node::Map(root)
 }
 
+/// Windows-1252 code points for bytes 0x80..=0x9F (None = undefined in cp1252).
+const CP1252_80_9F: [Option<char>; 32] = [
+    Some('\u{20AC}'), None, Some('\u{201A}'), Some('\u{0192}'),
+    Some('\u{201E}'), Some('\u{2026}'), Some('\u{2020}'), Some('\u{2021}'),
+    Some('\u{02C6}'), Some('\u{2030}'), Some('\u{0160}'), Some('\u{2039}'),
+    Some('\u{0152}'), None, Some('\u{017D}'), None,
+    None, Some('\u{2018}'), Some('\u{2019}'), Some('\u{201C}'),
+    Some('\u{201D}'), Some('\u{2022}'), Some('\u{2013}'), Some('\u{2014}'),
+    Some('\u{02DC}'), Some('\u{2122}'), Some('\u{0161}'), Some('\u{203A}'),
+    Some('\u{0153}'), None, Some('\u{017E}'), Some('\u{0178}'),
+];
+
+/// Decode iRacing's session-info text, which is Windows-1252 (not UTF-8).
+pub fn decode_cp1252(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .map(|&b| match b {
+            0x80..=0x9F => CP1252_80_9F[(b - 0x80) as usize].unwrap_or('\u{FFFD}'),
+            _ => b as char, // 0x00-0x7F and 0xA0-0xFF are the same code points as Latin-1
+        })
+        .collect()
+}
+
 pub struct ParsedSession {
     pub info: SessionInfo,
     /// Identity of the session; a change means a new session.
@@ -336,6 +359,13 @@ mod tests {
         // Total garbage must not panic either.
         let _ = session_from_yaml("::::\n  - - -\n\t\u{0}", 0);
         let _ = parse("");
+    }
+
+    #[test]
+    fn decodes_cp1252() {
+        assert_eq!(decode_cp1252(b"N\xFCrburgring"), "N\u{fc}rburgring");
+        assert_eq!(decode_cp1252(b"a\x80b\x9Fc\x81"), "a\u{20ac}b\u{178}c\u{fffd}");
+        assert_eq!(decode_cp1252(b"plain: ascii\n"), "plain: ascii\n");
     }
 
     #[test]
