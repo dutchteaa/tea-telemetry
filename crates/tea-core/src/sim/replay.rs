@@ -10,6 +10,7 @@
 use super::{PollResult, Sim, SimSource};
 use crate::frame::{Channel, Frame};
 use anyhow::Context;
+use bincode::Options;
 use serde::{Deserialize, Serialize};
 use std::fs::File;
 use std::io::{BufReader, BufWriter};
@@ -20,6 +21,16 @@ use std::time::Duration;
 const CAPTURE_VERSION: u32 = 2;
 const MAX_REALTIME_GAP_S: f64 = 0.5;
 const NON_FRAME_DELAY: Duration = Duration::from_millis(16);
+/// A single record bigger than this is corrupt (or hostile): reject it instead of
+/// trusting its length prefixes and reading (or allocating for) arbitrarily much data.
+const MAX_RECORD_BYTES: u64 = 64 * 1024 * 1024;
+
+/// The exact settings `bincode::serialize_into`/`deserialize_from` use (fixint,
+/// little-endian, trailing bytes allowed), plus a size limit. Reader and writer must stay
+/// in lockstep here or captures stop round-tripping.
+fn record_options() -> impl bincode::Options {
+    bincode::DefaultOptions::new().with_fixint_encoding().allow_trailing_bytes().with_limit(MAX_RECORD_BYTES)
+}
 
 #[derive(Serialize, Deserialize)]
 struct CaptureHeader {
@@ -107,7 +118,7 @@ impl ReplaySource {
         // A truncated capture (app killed while capturing) simply ends early.
         // Other errors (corruption) are logged before ending.
         let events = std::iter::from_fn(move || {
-            match bincode::deserialize_from::<_, PollResult>(&mut dec) {
+            match record_options().deserialize_from::<_, PollResult>(&mut dec) {
                 Ok(ev) => Some(remap.apply(ev)),
                 Err(e) => {
                     if !is_clean_end(&e) {
@@ -254,6 +265,27 @@ mod tests {
         assert!(matches!(src.poll(), PollResult::Idle));
         assert!(matches!(src.poll(), PollResult::NotConnected));
         // Should not panic on further polls
+        assert!(matches!(src.poll(), PollResult::NotConnected));
+    }
+
+    #[test]
+    fn a_record_with_a_huge_vec_length_is_rejected_not_allocated() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("huge.tcap");
+        let header = CaptureHeader { version: CAPTURE_VERSION, sim: Sim::Iracing, channels: channel_names() };
+        let mut raw = Vec::new();
+        bincode::serialize_into(&mut raw, &header).unwrap();
+        // A Frame record whose values Vec length prefix is far bigger than any real
+        // channel list (Channel::COUNT), well past the per-record cap.
+        let mut huge = Frame::new(1.0, 1);
+        huge.values = vec![0.0f32; 20_000_000]; // ~76 MiB, exceeds MAX_RECORD_BYTES
+        bincode::serialize_into(&mut raw, &PollResult::Frame(huge)).unwrap();
+        let compressed = zstd::encode_all(raw.as_slice(), 3).unwrap();
+        std::fs::write(&path, compressed).unwrap();
+
+        let mut src = ReplaySource::open(&path, false).unwrap();
+        // Rejected as corrupt, not delivered as a giant Frame, and no panic along the way.
+        assert!(matches!(src.poll(), PollResult::NotConnected));
         assert!(matches!(src.poll(), PollResult::NotConnected));
     }
 
