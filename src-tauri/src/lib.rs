@@ -1,3 +1,5 @@
+mod fatal;
+
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Duration;
@@ -66,17 +68,29 @@ pub fn run() {
         )
         .plugin(tauri_plugin_opener::init())
         .setup(move |app| {
-            let store = Store::open(&root)?;
-            let service = RecorderService::start(
-                source_factory(),
-                ServiceConfig {
-                    data_root: root.clone(),
-                    capture_raw: std::env::var_os("TEA_CAPTURE").is_some(),
-                    not_connected_backoff: Duration::from_secs(2),
-                },
-            )?;
-            app.manage(AppState { service, store: Mutex::new(store) });
-            Ok(())
+            let init = || -> anyhow::Result<AppState> {
+                let store = Store::open(&root)?;
+                let service = RecorderService::start(
+                    source_factory(),
+                    ServiceConfig {
+                        data_root: root.clone(),
+                        capture_raw: std::env::var_os("TEA_CAPTURE").is_some(),
+                        not_connected_backoff: Duration::from_secs(2),
+                    },
+                )?;
+                Ok(AppState { service, store: Mutex::new(store) })
+            };
+            match init() {
+                Ok(state) => {
+                    app.manage(state);
+                    Ok(())
+                }
+                Err(e) => {
+                    log::error!("startup failed: {e:#}");
+                    fatal::show_fatal_error(&format!("Tea Telemetry could not start:\n\n{e:#}"));
+                    Err(e.into())
+                }
+            }
         })
         .invoke_handler(tauri::generate_handler![get_status, recent_laps])
         .run(tauri::generate_context!())

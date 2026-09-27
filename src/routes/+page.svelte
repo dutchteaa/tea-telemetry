@@ -13,6 +13,7 @@
 
   type LapSummary = {
     lap_id: string;
+    session_id: string;
     sim: string;
     track_name: string;
     track_config: string;
