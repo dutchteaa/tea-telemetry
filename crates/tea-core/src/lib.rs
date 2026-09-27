@@ -2,7 +2,11 @@
 
 pub mod frame;
 pub mod laptime;
+pub mod recorder;
 pub mod sim;
+
+#[cfg(test)]
+mod testutil;
 
 #[cfg(test)]
 mod tests {
