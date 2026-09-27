@@ -107,6 +107,15 @@ pub fn run() {
             }
         })
         .invoke_handler(tauri::generate_handler![get_status, recent_laps])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app, event| {
+            // The event loop ends the process without running destructors, so stop the
+            // recorder here: it saves a lap waiting for its sim time and finishes captures.
+            if let tauri::RunEvent::Exit = event {
+                if let Some(state) = app.try_state::<AppState>() {
+                    state.service.shutdown();
+                }
+            }
+        });
 }

@@ -1,6 +1,6 @@
 //! The background recorder: polls a sim, splits laps, saves them. Survives panics.
 
-use crate::recorder::Recorder;
+use crate::recorder::{CompletedLap, Recorder};
 use crate::sim::replay::CaptureWriter;
 use crate::sim::{PollResult, Sim, SimSource};
 use crate::store::Store;
@@ -46,7 +46,7 @@ pub struct ServiceConfig {
 pub struct RecorderService {
     status: Arc<Mutex<RecorderStatus>>,
     stop: Arc<AtomicBool>,
-    handle: Option<JoinHandle<()>>,
+    handle: Mutex<Option<JoinHandle<()>>>,
 }
 
 fn lock(status: &Mutex<RecorderStatus>) -> MutexGuard<'_, RecorderStatus> {
@@ -68,20 +68,27 @@ impl RecorderService {
         let handle = thread::Builder::new()
             .name("recorder".into())
             .spawn(move || supervise(factory, config, store, thread_status, thread_stop))?;
-        Ok(Self { status, stop, handle: Some(handle) })
+        Ok(Self { status, stop, handle: Mutex::new(Some(handle)) })
     }
 
     pub fn status(&self) -> RecorderStatus {
         lock(&self.status).clone()
     }
+
+    /// Stop recording: saves a lap still waiting for the sim's lap time, finishes any
+    /// capture, and waits for the recorder thread. Safe to call more than once.
+    pub fn shutdown(&self) {
+        self.stop.store(true, Ordering::SeqCst);
+        let handle = self.handle.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take();
+        if let Some(h) = handle {
+            let _ = h.join();
+        }
+    }
 }
 
 impl Drop for RecorderService {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::SeqCst);
-        if let Some(h) = self.handle.take() {
-            let _ = h.join();
-        }
+        self.shutdown();
     }
 }
 
@@ -154,18 +161,7 @@ fn run(
             c.write(&event)?;
         }
         let not_connected = matches!(event, PollResult::NotConnected);
-        for lap in recorder.handle(event, now_ms()) {
-            match store.save_lap(&lap, now_ms()) {
-                Ok(()) => {
-                    log::info!("saved lap {} ({} ms)", lap.lap_number, lap.lap_time_ms);
-                    lock(status).laps_saved += 1;
-                }
-                Err(e) => {
-                    log::error!("failed to save lap {}: {e:#}", lap.lap_number);
-                    lock(status).last_error = Some(format!("failed to save lap: {e:#}"));
-                }
-            }
-        }
+        save_laps(store, status, recorder.handle(event, now_ms()));
         {
             let mut s = lock(status);
             s.sim = (!not_connected).then(|| source.sim());
@@ -182,7 +178,24 @@ fn run(
             sleep_unless_stopped(config.not_connected_backoff, stop);
         }
     }
-    Ok(())
+    // Shutting down: keep a lap that was only waiting for the sim's official time.
+    save_laps(store, status, recorder.handle(PollResult::NotConnected, now_ms()));
+    Ok(()) // dropping `capture` finishes the file
+}
+
+fn save_laps(store: &mut Store, status: &Mutex<RecorderStatus>, laps: Vec<CompletedLap>) {
+    for lap in laps {
+        match store.save_lap(&lap, now_ms()) {
+            Ok(()) => {
+                log::info!("saved lap {} ({} ms)", lap.lap_number, lap.lap_time_ms);
+                lock(status).laps_saved += 1;
+            }
+            Err(e) => {
+                log::error!("failed to save lap {}: {e:#}", lap.lap_number);
+                lock(status).last_error = Some(format!("failed to save lap: {e:#}"));
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -237,6 +250,44 @@ mod tests {
         let laps = store.recent_laps(10).unwrap();
         assert_eq!(laps.len(), 2);
         assert!(laps.iter().all(|l| l.lap_time_ms == 100_000));
+    }
+
+    /// Plays `events`, then reports Paused forever (the sim is still running).
+    struct ThenPaused(std::collections::VecDeque<PollResult>);
+
+    impl SimSource for ThenPaused {
+        fn sim(&self) -> Sim {
+            Sim::Iracing
+        }
+        fn poll(&mut self) -> PollResult {
+            self.0.pop_front().unwrap_or_else(|| {
+                std::thread::sleep(Duration::from_millis(1));
+                PollResult::Paused
+            })
+        }
+    }
+
+    #[test]
+    fn shutdown_saves_the_lap_waiting_for_its_sim_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut events = vec![PollResult::Session(session())];
+        // Lap 2 is saved after its 90-frame wait; lap 3 closes 5.5 s before the end of
+        // the events, so it is still waiting for the sim's lap time when we shut down.
+        events.extend(drive(1, 0.5553, 250.0).into_iter().map(PollResult::Frame));
+        let factory: SourceFactory =
+            Box::new(move || -> Box<dyn SimSource> { Box::new(ThenPaused(events.clone().into())) });
+        let svc = RecorderService::start(factory, config(dir.path())).unwrap();
+        let status = wait_for(&svc, |s| s.lap == Some(4));
+        assert_eq!((status.lap, status.laps_saved), (Some(4), 1));
+        svc.shutdown();
+        svc.shutdown(); // idempotent
+        assert_eq!(svc.status().laps_saved, 2);
+        drop(svc);
+
+        let store = Store::open(dir.path()).unwrap();
+        let mut numbers: Vec<i32> = store.recent_laps(10).unwrap().iter().map(|l| l.lap_number).collect();
+        numbers.sort();
+        assert_eq!(numbers, vec![2, 3]);
     }
 
     #[test]
