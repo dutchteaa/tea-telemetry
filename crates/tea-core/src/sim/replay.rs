@@ -53,8 +53,22 @@ impl ReplaySource {
         if header.version > CAPTURE_VERSION {
             anyhow::bail!("capture was made by a newer version of Tea Telemetry");
         }
+        let path_str = path.display().to_string();
         // A truncated capture (app killed while capturing) simply ends early.
-        let events = std::iter::from_fn(move || bincode::deserialize_from::<_, PollResult>(&mut dec).ok());
+        // Other errors (corruption) are logged before ending.
+        let events = std::iter::from_fn(move || {
+            match bincode::deserialize_from::<_, PollResult>(&mut dec) {
+                Ok(ev) => Some(ev),
+                Err(e) => {
+                    // Check if it's a clean EOF by looking at the error message
+                    let is_eof = e.to_string().contains("UnexpectedEof");
+                    if !is_eof {
+                        log::warn!("capture {}: stopped reading after a corrupt record: {}", path_str, e);
+                    }
+                    None
+                }
+            }
+        });
         Ok(Self { sim: header.sim, events: Box::new(events), realtime, last_time_s: None })
     }
 
@@ -152,5 +166,31 @@ mod tests {
         let path = dir.path().join("bad.tcap");
         std::fs::write(&path, b"nope").unwrap();
         assert!(ReplaySource::open(&path, false).is_err());
+    }
+
+    #[test]
+    fn corrupt_record_ends_replay_without_panicking() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("corrupt.tcap");
+
+        // Build raw uncompressed stream: bincode header + one valid event + corrupt bytes
+        let mut raw = Vec::new();
+        let header = CaptureHeader { version: CAPTURE_VERSION, sim: Sim::Iracing };
+        bincode::serialize_into(&mut raw, &header).unwrap();
+        bincode::serialize_into(&mut raw, &PollResult::Idle).unwrap();
+        // Append 16 bytes of 0xFF to corrupt the next record
+        raw.extend_from_slice(&[0xFF; 16]);
+
+        // Compress with zstd and write to file
+        let compressed = zstd::encode_all(raw.as_slice(), 3).unwrap();
+        std::fs::write(&path, compressed).unwrap();
+
+        // Open and verify it yields the valid event then stops
+        let mut src = ReplaySource::open(&path, false).unwrap();
+        assert_eq!(src.sim(), Sim::Iracing);
+        assert!(matches!(src.poll(), PollResult::Idle));
+        assert!(matches!(src.poll(), PollResult::NotConnected));
+        // Should not panic on further polls
+        assert!(matches!(src.poll(), PollResult::NotConnected));
     }
 }
