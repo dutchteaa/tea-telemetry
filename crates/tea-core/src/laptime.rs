@@ -26,6 +26,40 @@ pub fn line_crossing_time(a: &Frame, b: &Frame) -> f64 {
     a.session_time_s + (before / total) * (b.session_time_s - a.session_time_s)
 }
 
+/// How many consecutive sample pairs to search for the actual line crossing, when the
+/// sim's Lap counter changes a frame or two before or after `LapDistPct` actually wraps.
+const WRAP_SEARCH_PAIRS: usize = 5;
+
+/// Search `frames`' consecutive pairs for a wrap (`pa > 0.5 && pb < 0.5`, both finite) and
+/// return its interpolated crossing time. Falls back to `line_crossing_time(fallback.0,
+/// fallback.1)` if none of the pairs is a wrap.
+fn find_wrap(frames: &[Frame], fallback: (&Frame, &Frame)) -> f64 {
+    frames
+        .windows(2)
+        .find_map(|w| {
+            let (pa, pb) = (pct(&w[0]), pct(&w[1]));
+            (pa.is_finite() && pb.is_finite() && pa > 0.5 && pb < 0.5)
+                .then(|| line_crossing_time(&w[0], &w[1]))
+        })
+        .unwrap_or_else(|| line_crossing_time(fallback.0, fallback.1))
+}
+
+/// A lap's start-line crossing time. `samples[0]` and `samples[1]` are normally the wrap
+/// pair, but the sim may bump `Lap` a frame or two after `LapDistPct` actually wraps; this
+/// searches forward through the first few pairs for the real crossing.
+pub fn lap_start_time(samples: &[Frame]) -> f64 {
+    let end = (WRAP_SEARCH_PAIRS + 1).min(samples.len());
+    find_wrap(&samples[..end], (&samples[0], &samples[1]))
+}
+
+/// A lap's finish-line crossing time; the mirror of [`lap_start_time`] for the sim
+/// bumping `Lap` a frame or two before `LapDistPct` actually wraps.
+pub fn lap_end_time(samples: &[Frame]) -> f64 {
+    let n = samples.len();
+    let start = n.saturating_sub(WRAP_SEARCH_PAIRS + 1);
+    find_wrap(&samples[start..], (&samples[n - 2], &samples[n - 1]))
+}
+
 /// Session time at which the car passed `target` between `a` and `b` (no wrap), if it did.
 fn pct_crossing_time(a: &Frame, b: &Frame, target: f64) -> Option<f64> {
     let (pa, pb) = (pct(a), pct(b));

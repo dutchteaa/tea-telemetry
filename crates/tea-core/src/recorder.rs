@@ -1,7 +1,7 @@
 //! Turns a stream of [`PollResult`]s into completed laps.
 
 use crate::frame::{Channel, Frame};
-use crate::laptime::{line_crossing_time, sector_times_ms, to_ms};
+use crate::laptime::{lap_end_time, lap_start_time, sector_times_ms, to_ms};
 use crate::sim::{PollResult, SessionInfo};
 
 /// Frames to wait after a lap closes for the sim to publish its official lap time.
@@ -181,8 +181,8 @@ impl Recorder {
         if n < 3 {
             return;
         }
-        let start = line_crossing_time(&s[0], &s[1]);
-        let end = line_crossing_time(&s[n - 2], &s[n - 1]);
+        let start = lap_start_time(s);
+        let end = lap_end_time(s);
         let computed = end - start;
         if !(computed > 0.0) {
             return;
@@ -386,10 +386,12 @@ mod tests {
         let laps = run_with(&|f| if at(f, 144.45, 144.55) { f.lap = 2 });
         let lap2 = laps.iter().find(|l| l.lap_number == 2).expect("lap 2");
         assert_eq!(lap2.invalid_reason, None);
+        assert_eq!(lap2.lap_time_ms, 100_000);
         // Early: Lap says 3 while pct is still 0.9947.
         let laps = run_with(&|f| if at(f, 144.35, 144.45) { f.lap = 3 });
         let lap3 = laps.iter().find(|l| l.lap_number == 3).expect("lap 3");
         assert_eq!(lap3.invalid_reason, None);
+        assert_eq!(lap3.lap_time_ms, 100_000);
     }
 
     #[test]
