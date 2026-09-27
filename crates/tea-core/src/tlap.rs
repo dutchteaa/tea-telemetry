@@ -6,6 +6,8 @@ use serde::{Deserialize, Serialize};
 pub const FORMAT_VERSION: u32 = 1;
 const MAGIC: &[u8; 4] = b"TLAP";
 const PREFIX_LEN: usize = 12;
+/// zstd frame magic number, little-endian.
+const ZSTD_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ChannelEntry {
@@ -90,7 +92,14 @@ pub fn encode(header: &mut TlapHeader, data: &[Vec<f32>]) -> Result<Vec<u8>, Tla
 }
 
 pub fn decode(bytes: &[u8]) -> Result<TlapFile, TlapError> {
-    let raw = zstd::decode_all(bytes).map_err(|_| TlapError::BadMagic)?;
+    let raw = zstd::decode_all(bytes).map_err(|e| {
+        if bytes.starts_with(&ZSTD_MAGIC) {
+            // It really is (the start of) a .tlap file; it just didn't survive intact.
+            TlapError::Corrupt(format!("couldn't decompress: {e}"))
+        } else {
+            TlapError::BadMagic
+        }
+    })?;
     if raw.len() < PREFIX_LEN || &raw[0..4] != MAGIC {
         return Err(TlapError::BadMagic);
     }
@@ -200,6 +209,17 @@ mod tests {
         let err = decode(&bytes).unwrap_err();
         assert!(matches!(err, TlapError::NewerVersion { found: 2, supported: 1 }));
         assert!(err.to_string().contains("newer version"));
+    }
+
+    #[test]
+    fn truncated_zstd_frame_reports_corrupt_not_bad_magic() {
+        let mut h = header();
+        let data = vec![vec![0.0, 0.1, 0.2], vec![70.0, 71.0, 71.5]];
+        let bytes = encode(&mut h, &data).unwrap();
+        // A real zstd frame (the magic is intact) cut off partway through: the sim or
+        // disk died mid-write, not a file that was never a .tlap at all.
+        let truncated = &bytes[..bytes.len() - 4];
+        assert!(matches!(decode(truncated), Err(TlapError::Corrupt(_))));
     }
 
     #[test]
