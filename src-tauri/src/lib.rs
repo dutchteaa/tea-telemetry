@@ -2,7 +2,7 @@ mod fatal;
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tauri::Manager;
 use tauri_plugin_log::{RotationStrategy, Target, TargetKind};
@@ -36,7 +36,9 @@ fn data_root() -> PathBuf {
 }
 
 /// Real iRacing, or a replayed capture when `TEA_MOCK` points at a `.tcap` file.
-fn source_factory() -> SourceFactory {
+/// With `capture`, the live source also dumps raw shared-memory data to
+/// `captures/<unix ms>/` for building parser fixtures.
+fn source_factory(root: &Path, capture: bool) -> SourceFactory {
     match std::env::var_os("TEA_MOCK") {
         Some(path) => {
             log::info!("mock sim: replaying {}", Path::new(&path).display());
@@ -47,7 +49,18 @@ fn source_factory() -> SourceFactory {
                 }
             })
         }
-        None => Box::new(|| -> Box<dyn SimSource> { Box::new(tea_core::sim::iracing::live_source()) }),
+        None => {
+            let captures = root.join("captures");
+            Box::new(move || -> Box<dyn SimSource> {
+                let source = tea_core::sim::iracing::live_source();
+                if capture {
+                    let ms = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
+                    Box::new(source.with_raw_dump(captures.join(ms.to_string())))
+                } else {
+                    Box::new(source)
+                }
+            })
+        }
     }
 }
 
@@ -70,11 +83,12 @@ pub fn run() {
         .setup(move |app| {
             let init = || -> anyhow::Result<AppState> {
                 let store = Store::open(&root)?;
+                let capture = std::env::var_os("TEA_CAPTURE").is_some();
                 let service = RecorderService::start(
-                    source_factory(),
+                    source_factory(&root, capture),
                     ServiceConfig {
                         data_root: root.clone(),
-                        capture_raw: std::env::var_os("TEA_CAPTURE").is_some(),
+                        capture_raw: capture,
                         not_connected_backoff: Duration::from_secs(2),
                     },
                 )?;

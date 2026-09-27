@@ -4,6 +4,7 @@ use super::layout::{parse_var_headers, IrHeader, HEADER_LEN, VAR_HEADER_LEN};
 use super::mapping::VarMap;
 use super::yaml::{decode_cp1252, session_from_yaml, ParsedSession};
 use crate::sim::{PollResult, SessionInfo, Sim, SimSource};
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 /// Max time one poll blocks waiting for the sim to publish a sample.
@@ -21,8 +22,27 @@ pub trait SharedMem {
 
 struct Disconnected;
 
+/// Debug dump of the raw bytes behind a connection, for building parser fixtures:
+/// `header-vars-<conn>.bin` (header + var headers, once) and `session-<conn>-<update>.yaml`
+/// (each distinct session-info update, as the sim wrote it).
+struct RawDump {
+    dir: PathBuf,
+    connection: u32,
+    layout_written: bool,
+}
+
+impl RawDump {
+    fn write(&self, name: &str, bytes: &[u8]) {
+        let result = std::fs::create_dir_all(&self.dir).and_then(|()| std::fs::write(self.dir.join(name), bytes));
+        if let Err(e) = result {
+            log::warn!("raw dump: couldn't write {name}: {e}");
+        }
+    }
+}
+
 struct Connection<M> {
     mem: M,
+    dump: Option<RawDump>,
     vars: VarMap,
     var_layout: Option<(i32, i32)>,
     /// Tick of the newest sample already delivered.
@@ -42,9 +62,10 @@ struct Connection<M> {
 }
 
 impl<M: SharedMem> Connection<M> {
-    fn new(mem: M, now: Instant, frozen_tick: Option<i32>) -> Self {
+    fn new(mem: M, dump: Option<RawDump>, now: Instant, frozen_tick: Option<i32>) -> Self {
         Self {
             mem,
+            dump,
             vars: VarMap::default(),
             var_layout: None,
             last_tick: None,
@@ -94,6 +115,12 @@ impl<M: SharedMem> Connection<M> {
             let vars = parse_var_headers(&bytes, n).map_err(|_| Disconnected)?;
             self.vars = VarMap::resolve(&vars);
             self.var_layout = Some(layout);
+            if let Some(dump) = self.dump.as_mut().filter(|d| !d.layout_written) {
+                let mut raw = self.mem.read(0, HEADER_LEN).ok_or(Disconnected)?;
+                raw.extend_from_slice(&bytes);
+                dump.write(&format!("header-vars-{}.bin", dump.connection), &raw);
+                dump.layout_written = true;
+            }
         }
 
         let Some(latest) = header.latest_buf() else { return Ok(PollResult::Paused) };
@@ -152,6 +179,11 @@ impl<M: SharedMem> Connection<M> {
         }
         let end = raw.iter().position(|&c| c == 0).unwrap_or(raw.len());
         raw.truncate(end);
+        if let Some(dump) = &self.dump {
+            if self.session_info_update != Some(header.session_info_update) {
+                dump.write(&format!("session-{}-{}.yaml", dump.connection, header.session_info_update), &raw);
+            }
+        }
         Ok(Some(raw))
     }
 
@@ -195,11 +227,27 @@ pub struct IracingSource<M: SharedMem> {
     /// Carried from a connection that went stale to the next one.
     frozen_tick: Option<i32>,
     clock: Box<dyn Fn() -> Instant>,
+    raw_dump_dir: Option<PathBuf>,
+    connections: u32,
 }
 
 impl<M: SharedMem> IracingSource<M> {
     pub fn new(connect: Box<dyn FnMut() -> Option<M>>) -> Self {
-        Self { connect, conn: None, frozen_tick: None, clock: Box::new(Instant::now) }
+        Self {
+            connect,
+            conn: None,
+            frozen_tick: None,
+            clock: Box::new(Instant::now),
+            raw_dump_dir: None,
+            connections: 0,
+        }
+    }
+
+    /// Debug: also dump the raw shared-memory layout and every session-info YAML into
+    /// `dir`, so real data can become parser test fixtures.
+    pub fn with_raw_dump(mut self, dir: PathBuf) -> Self {
+        self.raw_dump_dir = Some(dir);
+        self
     }
 
     /// Replace the wall clock used for staleness (tests).
@@ -219,7 +267,15 @@ impl<M: SharedMem> SimSource for IracingSource<M> {
         let now = (self.clock)();
         if self.conn.is_none() {
             match (self.connect)() {
-                Some(mem) => self.conn = Some(Connection::new(mem, now, self.frozen_tick)),
+                Some(mem) => {
+                    self.connections += 1;
+                    let dump = self.raw_dump_dir.clone().map(|dir| RawDump {
+                        dir,
+                        connection: self.connections,
+                        layout_written: false,
+                    });
+                    self.conn = Some(Connection::new(mem, dump, now, self.frozen_tick));
+                }
                 None => return PollResult::NotConnected,
             }
         }
@@ -279,6 +335,10 @@ mod tests {
 
     impl Rig {
         fn new() -> Rig {
+            Rig::build(None)
+        }
+
+        fn build(raw_dump: Option<PathBuf>) -> Rig {
             let mut b = ImageBuilder::new()
                 .var("SessionTime", VarType::Double)
                 .var("Lap", VarType::Int)
@@ -309,6 +369,10 @@ mod tests {
                 r2.get().then(|| FakeMem { img: i2.clone(), hook: h2.clone() })
             }))
             .with_clock(Box::new(move || c2.get()));
+            let src = match raw_dump {
+                Some(dir) => src.with_raw_dump(dir),
+                None => src,
+            };
             Rig { src, b, img, running, hook, clock }
         }
 
@@ -560,6 +624,39 @@ mod tests {
         rig.tick();
         expect_session(rig.src.poll());
         expect_frame(rig.src.poll());
+    }
+
+    #[test]
+    fn raw_dump_writes_layout_once_and_each_session_info_update() {
+        let dir = tempfile::tempdir().unwrap();
+        let dump = dir.path().join("captures").join("123");
+        let mut rig = Rig::build(Some(dump.clone()));
+        let first_img = rig.img.borrow().clone();
+        expect_session(rig.src.poll());
+        expect_frame(rig.src.poll());
+        rig.tick();
+        expect_frame(rig.src.poll()); // same YAML: nothing new to dump
+        rig.publish_yaml(SAMPLE_YAML.replace("TrackAirTemp: 22.40 C", "TrackAirTemp: 23.00 C"));
+        expect_frame(rig.src.poll());
+
+        let layout_len = HEADER_LEN + 11 * VAR_HEADER_LEN;
+        assert!(std::fs::read(dump.join("header-vars-1.bin")).unwrap() == first_img[..layout_len]);
+        assert_eq!(std::fs::read(dump.join("session-1-1.yaml")).unwrap(), SAMPLE_YAML.as_bytes());
+        let second = std::fs::read_to_string(dump.join("session-1-2.yaml")).unwrap();
+        assert!(second.contains("TrackAirTemp: 23.00 C"));
+        assert_eq!(std::fs::read_dir(&dump).unwrap().count(), 3);
+
+        // A reconnect gets its own files instead of overwriting the first connection's.
+        rig.running.set(false);
+        rig.b.status = 0;
+        rig.tick();
+        assert!(matches!(rig.src.poll(), PollResult::NotConnected));
+        rig.running.set(true);
+        rig.b.status = 1;
+        rig.tick();
+        expect_session(rig.src.poll());
+        assert!(dump.join("header-vars-2.bin").exists());
+        assert!(dump.join("session-2-2.yaml").exists());
     }
 
     #[test]
