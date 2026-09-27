@@ -93,3 +93,52 @@ impl ImageBuilder {
         img
     }
 }
+
+pub const SAMPLE_YAML: &str = "---
+WeekendInfo:
+ TrackName: spa 2024 up
+ TrackID: 525
+ TrackLength: 6.93 km
+ TrackDisplayName: Circuit de Spa-Francorchamps
+ TrackConfigName: Grand Prix
+ TrackSkies: Partly Cloudy
+ TrackSurfaceTemp: 31.20 C
+ TrackAirTemp: 22.40 C
+ SubSessionID: 0
+ WeekendOptions:
+  NumStarters: 0
+  StartingGrid: single file
+SessionInfo:
+ Sessions:
+ - SessionNum: 0
+   SessionLaps: unlimited
+   SessionTime: 7200.0000 sec
+   SessionType: Practice
+   ResultsPositions:
+   - Position: 1
+     CarIdx: 0
+   - Position: 2
+     CarIdx: 1
+ - SessionNum: 1
+   SessionType: Race
+DriverInfo:
+ DriverCarIdx: 1
+ Drivers:
+ - CarIdx: 0
+   UserName: Pace Car
+   CarID: 11
+   CarScreenName: safety pcporsche911cup
+ - CarIdx: 1
+   UserName: \"Test Driver: One\"
+   CarID: 170
+   CarScreenName: Porsche 963 GTP
+SplitTimeInfo:
+ Sectors:
+ - SectorNum: 0
+   SectorStartPct: 0.000000
+ - SectorNum: 1
+   SectorStartPct: 0.330000
+ - SectorNum: 2
+   SectorStartPct: 0.660000
+...
+";
