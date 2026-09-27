@@ -235,7 +235,12 @@ impl Recorder {
         let timed_out = p.frames_waited >= SIM_LAP_TIME_WAIT_FRAMES;
         if let Some(t) = sim_time {
             let mut p = self.pending.take().expect("pending lap");
-            p.lap.lap_time_ms = to_ms(t as f64);
+            let new_time_ms = to_ms(t as f64);
+            let diff = new_time_ms - p.lap.lap_time_ms;
+            p.lap.lap_time_ms = new_time_ms;
+            if let Some(last) = p.lap.sector_times_ms.last_mut() {
+                *last += diff;
+            }
             out.push(p.lap);
         } else if timed_out {
             self.flush_pending(out);
@@ -310,6 +315,9 @@ mod tests {
         }
         let laps = run(&mut Recorder::new(), with_session(frames, PollResult::Idle));
         assert_eq!(laps[0].lap_time_ms, 100_200);
+        let sectors = &laps[0].sector_times_ms;
+        assert_eq!(sectors, &vec![30_000, 40_000, 30_200], "last sector absorbs the diff");
+        assert_eq!(sectors.iter().sum::<i64>(), laps[0].lap_time_ms);
     }
 
     #[test]
