@@ -139,7 +139,9 @@ pub struct VarHeader {
 }
 
 pub fn parse_var_headers(b: &[u8], num_vars: usize) -> Result<Vec<VarHeader>, LayoutError> {
-    need(b, num_vars * VAR_HEADER_LEN)?;
+    let required_len = num_vars.checked_mul(VAR_HEADER_LEN)
+        .ok_or_else(|| LayoutError::TooShort { need: usize::MAX, have: b.len() })?;
+    need(b, required_len)?;
     (0..num_vars)
         .map(|i| {
             let h = &b[i * VAR_HEADER_LEN..(i + 1) * VAR_HEADER_LEN];
@@ -237,5 +239,11 @@ mod tests {
         let mut bad = vec![0u8; VAR_HEADER_LEN];
         bad[0..4].copy_from_slice(&42i32.to_le_bytes());
         assert_eq!(parse_var_headers(&bad, 1), Err(LayoutError::BadType(42)));
+    }
+
+    #[test]
+    fn huge_var_count_is_an_error_not_a_panic() {
+        assert!(matches!(parse_var_headers(&[0u8; 144], usize::MAX), Err(LayoutError::TooShort { .. })));
+        assert!(matches!(parse_var_headers(&[0u8; 144], 1_000_000), Err(LayoutError::TooShort { .. })));
     }
 }
