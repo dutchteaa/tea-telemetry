@@ -674,6 +674,67 @@ mod tests {
     }
 
     #[test]
+    fn missing_session_time_var_yields_idle() {
+        // A buffer that doesn't publish SessionTime at all (e.g. a layout we don't
+        // recognize yet): there's nothing to build a Frame or announce a Session from.
+        let mut b = ImageBuilder::new().var("Lap", VarType::Int).var("LapDistPct", VarType::Float);
+        b.yaml = SAMPLE_YAML.to_string();
+        b.set("Lap", 3.0).set("LapDistPct", 0.25);
+        let img = Rc::new(RefCell::new(b.build()));
+        let hook: ReadHook = Rc::new(RefCell::new(None));
+        let (i2, h2) = (img.clone(), hook.clone());
+        let mut src = IracingSource::new(Box::new(move || Some(FakeMem { img: i2.clone(), hook: h2.clone() })));
+        let r = src.poll();
+        assert!(matches!(r, PollResult::Idle), "{r:?}");
+        // A later tick, still with no SessionTime var, stays Idle rather than a Frame.
+        b.tick += 1;
+        *img.borrow_mut() = b.build();
+        let r = src.poll();
+        assert!(matches!(r, PollResult::Idle), "{r:?}");
+    }
+
+    #[test]
+    fn var_layout_change_reresolves_the_var_map() {
+        let mut rig = Rig::new();
+        expect_session(rig.src.poll());
+        let f = expect_frame(rig.src.poll());
+        assert_eq!(f.get(Channel::SpeedMs), 55.5);
+
+        // A different var layout (e.g. after a car swap): a new var is inserted ahead of
+        // the others, so num_vars changes and every later var's data offset shifts too.
+        let mut b2 = ImageBuilder::new()
+            .var("SessionTime", VarType::Double)
+            .var("ExtraVar", VarType::Float)
+            .var("Lap", VarType::Int)
+            .var("LapLastLapTime", VarType::Float)
+            .var("LapDistPct", VarType::Float)
+            .var("Speed", VarType::Float)
+            .var("Clutch", VarType::Float)
+            .var("PlayerTrackSurface", VarType::Int)
+            .var("IsReplayPlaying", VarType::Bool)
+            .var("IsOnTrack", VarType::Bool)
+            .var("SessionNum", VarType::Int)
+            .var("OnPitRoad", VarType::Bool);
+        b2.yaml = SAMPLE_YAML.to_string();
+        b2.tick = rig.b.tick + 1;
+        b2.session_info_update = rig.b.session_info_update;
+        b2.set("SessionTime", 1234.6)
+            .set("ExtraVar", 999.0)
+            .set("Lap", 3.0)
+            .set("LapLastLapTime", -1.0)
+            .set("LapDistPct", 0.25)
+            .set("Speed", 77.7)
+            .set("Clutch", 0.25)
+            .set("PlayerTrackSurface", 3.0)
+            .set("IsOnTrack", 1.0);
+        *rig.img.borrow_mut() = b2.build();
+
+        let f2 = expect_frame(rig.src.poll());
+        assert_eq!(f2.session_time_s, 1234.6);
+        assert_eq!(f2.get(Channel::SpeedMs), 77.7, "must re-resolve offsets for the new layout");
+    }
+
+    #[test]
     fn raw_dump_writes_layout_once_and_each_session_info_update() {
         let dir = tempfile::tempdir().unwrap();
         let dump = dir.path().join("captures").join("123");

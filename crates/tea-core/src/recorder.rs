@@ -449,6 +449,71 @@ mod tests {
     }
 
     #[test]
+    fn not_connected_mid_lap_abandons_lap_and_clears_session() {
+        let mut rec = Recorder::new();
+        let mut ev = vec![PollResult::Session(session())];
+        ev.extend(drive(1, 0.5553, 60.0).into_iter().map(PollResult::Frame)); // mid lap 2
+        ev.push(PollResult::NotConnected);
+        let laps = run(&mut rec, ev);
+        assert!(laps.is_empty());
+        assert!(!rec.is_recording());
+        // Frames after NotConnected are ignored until a new Session arrives.
+        let more: Vec<PollResult> = drive(2, 0.0, 10.0).into_iter().map(PollResult::Frame).collect();
+        assert!(run(&mut rec, more).is_empty());
+        assert!(!rec.is_recording());
+    }
+
+    #[test]
+    fn overlapping_invalid_reasons_respect_priority() {
+        // in_lap (pit mid-lap) plus off_track: in_lap wins.
+        let lap = lap2_with(|f| {
+            if at(f, 140.0, 144.4) {
+                f.set(Channel::OnPitRoad, 1.0);
+            }
+            if at(f, 79.95, 80.05) {
+                f.set(Channel::OffTrack, 1.0);
+            }
+        });
+        assert_eq!(lap.invalid_reason, Some(InvalidReason::InLap));
+
+        // out_lap (pit right after the start line) plus a teleport reset: reset wins.
+        let lap = lap2_with(|f| {
+            if at(f, 44.4, 50.0) {
+                f.set(Channel::OnPitRoad, 1.0);
+            }
+            if at(f, 79.95, 80.05) {
+                let p = f.get(Channel::LapDistPct);
+                f.set(Channel::LapDistPct, p + 0.2);
+            }
+        });
+        assert_eq!(lap.invalid_reason, Some(InvalidReason::Reset));
+    }
+
+    #[test]
+    fn lap_counter_jump_or_regression_drops_the_lap_in_progress() {
+        let make = |lap: i32, pct: f32| {
+            let mut fr = Frame::new(T0, lap);
+            fr.set(Channel::LapDistPct, pct);
+            fr
+        };
+        let run_case = |bad_lap: i32| {
+            let mut rec = Recorder::new();
+            let events = vec![
+                PollResult::Session(session()),
+                PollResult::Frame(make(1, 0.9)),
+                PollResult::Frame(make(2, 0.0)), // lap 1 -> 2 starts
+                PollResult::Frame(make(2, 0.1)),
+                PollResult::Frame(make(bad_lap, 0.2)),
+            ];
+            let laps = run(&mut rec, events);
+            assert!(laps.is_empty(), "lap 2 must be dropped for bad_lap={bad_lap}");
+            assert_eq!(rec.current_lap(), None, "bad_lap={bad_lap}");
+        };
+        run_case(4); // forward jump (+2)
+        run_case(1); // backwards
+    }
+
+    #[test]
     fn session_change_discards_lap_in_progress() {
         let frames = drive(1, 0.5553, 250.0);
         let (first, second) = frames.split_at(1000); // split at t=1100, mid lap 2
