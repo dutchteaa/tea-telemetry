@@ -3,6 +3,7 @@
 pub mod frame;
 pub mod laptime;
 pub mod recorder;
+pub mod service;
 pub mod sim;
 pub mod store;
 pub mod tlap;
