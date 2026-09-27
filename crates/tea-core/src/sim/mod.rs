@@ -1,5 +1,7 @@
 //! Sim adapters and the types they share.
 
+pub mod replay;
+
 use crate::frame::Frame;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
