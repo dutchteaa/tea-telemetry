@@ -81,8 +81,16 @@ impl RecorderService {
         self.stop.store(true, Ordering::SeqCst);
         let handle = self.handle.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take();
         if let Some(h) = handle {
-            let _ = h.join();
+            join_recorder_thread(h);
         }
+    }
+}
+
+/// Join the recorder thread, logging rather than discarding a panic that escaped its own
+/// `catch_unwind` (see `supervise`).
+fn join_recorder_thread(handle: JoinHandle<()>) {
+    if let Err(payload) = handle.join() {
+        log::error!("recorder thread panicked: {}", panic_message(payload.as_ref()));
     }
 }
 
@@ -162,9 +170,10 @@ fn run(
         }
         let not_connected = matches!(event, PollResult::NotConnected);
         save_laps(store, status, recorder.handle(event, now_ms()));
+        let sim = (!not_connected).then(|| source.sim());
         {
             let mut s = lock(status);
-            s.sim = (!not_connected).then(|| source.sim());
+            s.sim = sim;
             s.state = if not_connected {
                 RecState::NoSim
             } else if recorder.is_recording() {
@@ -315,6 +324,12 @@ mod tests {
         let status = wait_for(&svc, |s| s.laps_saved >= 2);
         assert_eq!(status.laps_saved, 2, "recorder must recover and keep recording");
         assert!(status.last_error.unwrap_or_default().contains("boom"));
+    }
+
+    #[test]
+    fn joining_a_panicked_thread_does_not_panic_again() {
+        let handle = thread::spawn(|| panic!("boom: recorder thread panicked outside catch_unwind"));
+        join_recorder_thread(handle); // must log, not propagate the panic
     }
 
     #[test]
