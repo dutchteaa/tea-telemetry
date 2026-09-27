@@ -40,5 +40,7 @@ Sessions, laps and the index database live in `%APPDATA%\tea-telemetry`.
 
 ## Note
 
-Windows Smart App Control blocks locally built, unsigned binaries from running. Disable
-it (or build in a mode it allows) if the app won't launch.
+Windows Smart App Control blocks locally built, unsigned binaries from running. On many
+Windows 11 builds, once Smart App Control has been turned off it cannot be turned back
+on without resetting Windows, so check whether it's on (Settings > Privacy & security >
+Windows Security > App & browser control) and factor that in before disabling it.

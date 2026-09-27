@@ -28,7 +28,7 @@ pub fn line_crossing_time(a: &Frame, b: &Frame) -> f64 {
 
 /// How many consecutive sample pairs to search for the actual line crossing, when the
 /// sim's Lap counter changes a frame or two before or after `LapDistPct` actually wraps.
-const WRAP_SEARCH_PAIRS: usize = 5;
+pub(crate) const WRAP_SEARCH_PAIRS: usize = 5;
 
 /// Search `frames`' consecutive pairs for a wrap (`pa > 0.5 && pb < 0.5`, both finite) and
 /// return its interpolated crossing time. Falls back to `line_crossing_time(fallback.0,

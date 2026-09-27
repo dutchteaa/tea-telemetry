@@ -1,7 +1,7 @@
 //! Turns a stream of [`PollResult`]s into completed laps.
 
 use crate::frame::{Channel, Frame};
-use crate::laptime::{lap_end_time, lap_start_time, sector_times_ms, to_ms};
+use crate::laptime::{lap_end_time, lap_start_time, line_crossing_time, sector_times_ms, to_ms, WRAP_SEARCH_PAIRS};
 use crate::sim::{PollResult, SessionInfo};
 
 /// Frames to wait after a lap closes for the sim to publish its official lap time.
@@ -67,11 +67,17 @@ struct LapInProgress {
     lap_number: i32,
     samples: Vec<Frame>,
     reset: bool,
+    /// This lap's start-line crossing time, once known for certain: either carried over
+    /// from the previous lap's own end computation (when the Lap counter changed after
+    /// `LapDistPct` already wrapped, so only the *previous* lap's samples contained the
+    /// real wrap), or discovered by searching this lap's own early samples (the mirror
+    /// case). `None` until then; `close_lap` falls back to a fresh local search.
+    start_s: Option<f64>,
 }
 
 impl LapInProgress {
     fn starting(lap_number: i32, before_line: Frame, after_line: Frame) -> Self {
-        Self { lap_number, samples: vec![before_line, after_line], reset: false }
+        Self { lap_number, samples: vec![before_line, after_line], reset: false, start_s: None }
     }
 }
 
@@ -160,9 +166,15 @@ impl Recorder {
             (Some(n), Some(prev)) if f.lap == n + 1 => {
                 let mut finished = self.lap.take().expect("lap in progress");
                 finished.samples.push(f.clone());
-                self.close_lap(finished, out);
+                // If Lap changed after LapDistPct already wrapped, only the closing
+                // lap's own tail contains the real crossing (the new lap's first two
+                // samples are both already past it); carry that crossing forward as the
+                // new lap's start so it isn't rediscovered (badly) from scratch.
+                let end_crossing = self.close_lap(finished, out);
                 self.try_resolve_pending(&f, out);
-                self.lap = Some(LapInProgress::starting(f.lap, prev, f.clone()));
+                let mut new_lap = LapInProgress::starting(f.lap, prev, f.clone());
+                new_lap.start_s = end_crossing;
+                self.lap = Some(new_lap);
             }
             // Lap counter jumped or went backwards: the session was reset. Drop the lap.
             (Some(n), _) if f.lap != n => self.lap = None,
@@ -178,6 +190,21 @@ impl Recorder {
                     }
                 }
                 lap.samples.push(f.clone());
+                // Mirror case: Lap changed before LapDistPct wrapped, so the previous
+                // lap's own tail search found no wrap and used a rough fallback for its
+                // end. Once this lap's early samples reveal the real crossing, use it as
+                // this lap's start and fix up whatever's still waiting for the sim's
+                // official time (it shares this exact boundary).
+                if lap.start_s.is_none() && lap.samples.len() <= WRAP_SEARCH_PAIRS + 1 {
+                    let naive = line_crossing_time(&lap.samples[0], &lap.samples[1]);
+                    let discovered = lap_start_time(&lap.samples);
+                    if discovered != naive {
+                        lap.start_s = Some(discovered);
+                        if let Some(p) = self.pending.as_mut() {
+                            correct_pending_end(p, discovered);
+                        }
+                    }
+                }
                 if lap.samples.len() > self.max_lap_samples {
                     log::debug!(
                         "lap {}: {} samples exceeds the cap of {}; abandoning (stuck without crossing the line?)",
@@ -197,20 +224,30 @@ impl Recorder {
         self.prev = Some(f);
     }
 
-    fn close_lap(&mut self, lap: LapInProgress, out: &mut Vec<CompletedLap>) {
+    /// Closes `lap` and queues it as pending; returns its end (line-crossing) time so the
+    /// caller can carry it forward as the next lap's start, if that lap can't discover it
+    /// on its own (see the comments in `on_frame`).
+    fn close_lap(&mut self, lap: LapInProgress, out: &mut Vec<CompletedLap>) -> Option<f64> {
         // Only one lap can wait for the sim's time; an older one gets our computed time.
         self.flush_pending(out);
-        let Some(session) = self.session.as_ref() else { return };
+        let session = self.session.as_ref()?;
         let s = &lap.samples;
         let n = s.len();
         if n < 3 {
-            return;
+            return None;
         }
-        let start = lap_start_time(s);
+        let start = lap.start_s.unwrap_or_else(|| lap_start_time(s));
         let end = lap_end_time(s);
+        // Whether `end` came from an actual wrap found in the tail search, rather than
+        // just the naive last-pair fallback (which is what the next lap would compute
+        // for itself anyway, from the very same pair): only a genuine find is worth
+        // forwarding, since a fallback value is no better than what the next lap already
+        // has, and forwarding it anyway would block that lap from finding the real
+        // crossing itself (see the mirror case in `on_frame`).
+        let end_is_a_real_find = end != line_crossing_time(&s[n - 2], &s[n - 1]);
         let computed = end - start;
         if !(computed > 0.0) {
-            return;
+            return None;
         }
         let in_lap = &s[1..n - 1];
         let invalid_reason = if lap.reset {
@@ -248,6 +285,7 @@ impl Recorder {
             samples: lap.samples,
         };
         self.pending = Some(PendingLap { lap: completed, computed_s: computed, sim_time_before, frames_waited: 0 });
+        end_is_a_real_find.then_some(end)
     }
 
     fn try_resolve_pending(&mut self, f: &Frame, out: &mut Vec<CompletedLap>) {
@@ -260,12 +298,8 @@ impl Recorder {
         let timed_out = p.frames_waited >= SIM_LAP_TIME_WAIT_FRAMES;
         if let Some(t) = sim_time {
             let mut p = self.pending.take().expect("pending lap");
-            let new_time_ms = to_ms(t as f64);
-            let diff = new_time_ms - p.lap.lap_time_ms;
-            p.lap.lap_time_ms = new_time_ms;
-            if let Some(last) = p.lap.sector_times_ms.last_mut() {
-                *last += diff;
-            }
+            p.lap.lap_time_ms = to_ms(t as f64);
+            set_last_sector_to_match(&mut p.lap.sector_times_ms, p.lap.lap_time_ms);
             out.push(p.lap);
         } else if timed_out {
             self.flush_pending(out);
@@ -276,6 +310,27 @@ impl Recorder {
         if let Some(p) = self.pending.take() {
             out.push(p.lap);
         }
+    }
+}
+
+/// Adjust the still-pending lap's end to `new_end` (a boundary crossing discovered only
+/// once the *next* lap's early samples revealed it): recomputes its lap time from the
+/// unaffected start, and fixes up the last sector the same way the sim-time path does.
+fn correct_pending_end(p: &mut PendingLap, new_end: f64) {
+    let new_computed_s = new_end - p.lap.lap_start_s;
+    if !(new_computed_s > 0.0) {
+        return; // shouldn't happen; leave the original estimate rather than emit nonsense
+    }
+    p.computed_s = new_computed_s;
+    p.lap.lap_time_ms = to_ms(new_computed_s);
+    set_last_sector_to_match(&mut p.lap.sector_times_ms, p.lap.lap_time_ms);
+}
+
+/// Set the last sector so the sectors sum to exactly `lap_time_ms`, regardless of any
+/// independent rounding slop the individually-computed sectors may already carry.
+fn set_last_sector_to_match(sectors: &mut [i64], lap_time_ms: i64) {
+    if let Some((last, rest)) = sectors.split_last_mut() {
+        *last = lap_time_ms - rest.iter().sum::<i64>();
     }
 }
 
@@ -415,16 +470,31 @@ mod tests {
             frames.iter_mut().for_each(|f| edit(f));
             run(&mut Recorder::new(), with_session(frames, PollResult::Idle))
         };
-        // Late: pct wraps while Lap still says 2.
+        let clean_sectors = vec![30_000, 40_000, 30_000];
+
+        // Late: pct wraps while Lap still says 2. This boundary is lap 2's end AND lap
+        // 3's start: both must come out clean, not just the one whose own samples
+        // happen to contain the true wrap.
         let laps = run_with(&|f| if at(f, 144.45, 144.55) { f.lap = 2 });
         let lap2 = laps.iter().find(|l| l.lap_number == 2).expect("lap 2");
         assert_eq!(lap2.invalid_reason, None);
-        assert_eq!(lap2.lap_time_ms, 100_000);
-        // Early: Lap says 3 while pct is still 0.9947.
-        let laps = run_with(&|f| if at(f, 144.35, 144.45) { f.lap = 3 });
+        assert_eq!(lap2.lap_time_ms, 100_000, "lap 2 (late bump)");
+        assert_eq!(lap2.sector_times_ms, clean_sectors, "lap 2 (late bump) sectors");
         let lap3 = laps.iter().find(|l| l.lap_number == 3).expect("lap 3");
         assert_eq!(lap3.invalid_reason, None);
-        assert_eq!(lap3.lap_time_ms, 100_000);
+        assert_eq!(lap3.lap_time_ms, 100_000, "lap 3 (late bump)");
+        assert_eq!(lap3.sector_times_ms, clean_sectors, "lap 3 (late bump) sectors");
+
+        // Early: Lap says 3 while pct is still ~0.9993. Same boundary, opposite desync.
+        let laps = run_with(&|f| if at(f, 144.35, 144.45) { f.lap = 3 });
+        let lap2 = laps.iter().find(|l| l.lap_number == 2).expect("lap 2");
+        assert_eq!(lap2.invalid_reason, None);
+        assert_eq!(lap2.lap_time_ms, 100_000, "lap 2 (early bump)");
+        assert_eq!(lap2.sector_times_ms, clean_sectors, "lap 2 (early bump) sectors");
+        let lap3 = laps.iter().find(|l| l.lap_number == 3).expect("lap 3");
+        assert_eq!(lap3.invalid_reason, None);
+        assert_eq!(lap3.lap_time_ms, 100_000, "lap 3 (early bump)");
+        assert_eq!(lap3.sector_times_ms, clean_sectors, "lap 3 (early bump) sectors");
     }
 
     #[test]
@@ -457,10 +527,20 @@ mod tests {
         let laps = run(&mut rec, ev);
         assert!(laps.is_empty());
         assert!(!rec.is_recording());
-        // Frames after NotConnected are ignored until a new Session arrives.
-        let more: Vec<PollResult> = drive(2, 0.0, 10.0).into_iter().map(PollResult::Frame).collect();
-        assert!(run(&mut rec, more).is_empty());
+
+        // Frames after NotConnected are ignored, even ones that cross the line, until a
+        // new Session arrives.
+        let crossing: Vec<PollResult> = drive(1, 0.95, 20.0).into_iter().map(PollResult::Frame).collect();
+        assert!(run(&mut rec, crossing.clone()).is_empty(), "must not start tracking without a Session");
         assert!(!rec.is_recording());
+
+        // Once a new Session shows up, recording resumes at the next crossing.
+        let mut ev = vec![PollResult::Session(session())];
+        ev.extend(crossing);
+        let laps = run(&mut rec, ev);
+        assert!(laps.is_empty(), "one crossing starts tracking; it doesn't complete a lap yet");
+        assert!(rec.is_recording());
+        assert_eq!(rec.current_lap(), Some(2));
     }
 
     #[test]
@@ -491,8 +571,13 @@ mod tests {
 
     #[test]
     fn lap_counter_jump_or_regression_drops_the_lap_in_progress() {
-        let make = |lap: i32, pct: f32| {
-            let mut fr = Frame::new(T0, lap);
+        // Session time advances normally here: if a jump/regression were ever mistaken
+        // for a plausible increment, close_lap would compute a positive, plausible time
+        // and actually emit a lap, which is exactly what `laps.is_empty()` must catch
+        // (with every frame at the same timestamp, `computed_s <= 0.0` would keep the
+        // list empty regardless of whether the jump/regression handling worked at all).
+        let make = |t: f64, lap: i32, pct: f32| {
+            let mut fr = Frame::new(T0 + t, lap);
             fr.set(Channel::LapDistPct, pct);
             fr
         };
@@ -500,13 +585,13 @@ mod tests {
             let mut rec = Recorder::new();
             let events = vec![
                 PollResult::Session(session()),
-                PollResult::Frame(make(1, 0.9)),
-                PollResult::Frame(make(2, 0.0)), // lap 1 -> 2 starts
-                PollResult::Frame(make(2, 0.1)),
-                PollResult::Frame(make(bad_lap, 0.2)),
+                PollResult::Frame(make(0.0, 1, 0.9)),
+                PollResult::Frame(make(0.1, 2, 0.0)), // lap 1 -> 2 starts
+                PollResult::Frame(make(0.2, 2, 0.1)),
+                PollResult::Frame(make(0.3, bad_lap, 0.2)),
             ];
             let laps = run(&mut rec, events);
-            assert!(laps.is_empty(), "lap 2 must be dropped for bad_lap={bad_lap}");
+            assert!(laps.is_empty(), "lap 2 must be dropped for bad_lap={bad_lap}, not force-closed");
             assert_eq!(rec.current_lap(), None, "bad_lap={bad_lap}");
         };
         run_case(4); // forward jump (+2)
@@ -543,6 +628,49 @@ mod tests {
         let laps = run(&mut rec, with_session(drive(1, 0.5553, 160.0), PollResult::Idle));
         assert!(laps.is_empty(), "every lap exceeds the 5-sample cap before it can close");
         assert!(!rec.is_recording());
+    }
+
+    #[test]
+    fn lap_sample_cap_boundary_is_inclusive() {
+        // Pin the off-by-one: a continuing lap with exactly `cap` samples must survive
+        // (and go on to close normally), one more must abandon it. Session time advances
+        // normally so a survived lap gets a positive computed time and actually closes,
+        // rather than the `computed_s <= 0.0` guard hiding the answer either way. The cap
+        // is kept above the wrap-search window (5 pairs) so the closing search looks at
+        // the tail, not back at this lap's own start.
+        let make = |t: f64, lap: i32, pct: f32| {
+            let mut fr = Frame::new(T0 + t, lap);
+            fr.set(Channel::LapDistPct, pct);
+            fr
+        };
+        let cap = 8;
+        let ramp = [0.1, 0.3, 0.5, 0.7, 0.85, 0.95]; // 6 continuing pushes: samples 2..=8
+
+        // 2 (from starting()) + 6 continuing pushes = exactly `cap`; the next frame
+        // crosses the line and lap 2 must still close.
+        let mut rec = Recorder::with_max_lap_samples(cap);
+        let mut events = vec![PollResult::Session(session()), PollResult::Frame(make(0.0, 1, 0.9))];
+        events.push(PollResult::Frame(make(0.1, 2, 0.0))); // starting(): samples = 2
+        for (i, pct) in ramp.iter().enumerate() {
+            events.push(PollResult::Frame(make(0.2 + i as f64 * 0.1, 2, *pct))); // samples = 3..=8
+        }
+        events.push(PollResult::Frame(make(0.9, 3, 0.05))); // crosses the line
+        events.push(PollResult::Idle); // flush the lap out of `pending`
+        let laps = run(&mut rec, events);
+        assert!(laps.iter().any(|l| l.lap_number == 2), "exactly at the cap must still close");
+
+        // One more continuing frame tips it over the cap before it ever reaches the line.
+        let mut rec = Recorder::with_max_lap_samples(cap);
+        let mut events = vec![PollResult::Session(session()), PollResult::Frame(make(0.0, 1, 0.9))];
+        events.push(PollResult::Frame(make(0.1, 2, 0.0))); // samples = 2
+        for (i, pct) in ramp.iter().enumerate() {
+            events.push(PollResult::Frame(make(0.2 + i as f64 * 0.1, 2, *pct))); // samples = 3..=8
+        }
+        events.push(PollResult::Frame(make(0.8, 2, 0.97))); // samples = 9 > cap: abandoned
+        events.push(PollResult::Frame(make(0.9, 3, 0.05))); // would have crossed the line
+        events.push(PollResult::Idle);
+        let laps = run(&mut rec, events);
+        assert!(laps.iter().all(|l| l.lap_number != 2), "one over the cap must be abandoned first");
     }
 
     #[test]

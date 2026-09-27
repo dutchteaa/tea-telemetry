@@ -369,8 +369,13 @@ mod tests {
         let dir = tempdir().unwrap();
         let store = Store::open(dir.path()).unwrap();
         store.conn.execute("DROP TABLE laps", []).unwrap();
-        let err = store.read_lap_file("anything").unwrap_err().to_string();
-        assert!(!err.contains("not found"), "{err}");
+        let err = store.read_lap_file("anything").unwrap_err();
+        let top = err.to_string();
+        assert!(!top.contains("not found"), "{top}");
+        assert!(top.contains("looking up lap anything"), "{top}");
+        // The chain must still carry the real SQLite error, not just our own context.
+        let chain: Vec<String> = err.chain().map(|e| e.to_string()).collect();
+        assert!(chain.iter().any(|c| c.contains("no such table")), "{chain:?}");
     }
 
     #[test]

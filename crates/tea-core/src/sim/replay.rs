@@ -26,8 +26,8 @@ const NON_FRAME_DELAY: Duration = Duration::from_millis(16);
 const MAX_RECORD_BYTES: u64 = 64 * 1024 * 1024;
 
 /// The exact settings `bincode::serialize_into`/`deserialize_from` use (fixint,
-/// little-endian, trailing bytes allowed), plus a size limit. Reader and writer must stay
-/// in lockstep here or captures stop round-tripping.
+/// little-endian, trailing bytes allowed), plus a size limit. Used for the header and
+/// every record, on both the write and the read side, so they can't drift apart.
 fn record_options() -> impl bincode::Options {
     bincode::DefaultOptions::new().with_fixint_encoding().allow_trailing_bytes().with_limit(MAX_RECORD_BYTES)
 }
@@ -53,12 +53,12 @@ impl CaptureWriter {
         let file = BufWriter::new(File::create(path).with_context(|| format!("creating {}", path.display()))?);
         let mut enc = zstd::stream::write::Encoder::new(file, 3)?.auto_finish();
         let header = CaptureHeader { version: CAPTURE_VERSION, sim, channels: channel_names() };
-        bincode::serialize_into(&mut enc, &header)?;
+        record_options().serialize_into(&mut enc, &header)?;
         Ok(Self { enc })
     }
 
     pub fn write(&mut self, ev: &PollResult) -> anyhow::Result<()> {
-        bincode::serialize_into(&mut self.enc, ev)?;
+        record_options().serialize_into(&mut self.enc, ev)?;
         Ok(())
     }
 }
@@ -104,7 +104,9 @@ impl ReplaySource {
         let file = BufReader::new(File::open(path).with_context(|| format!("opening {}", path.display()))?);
         let mut dec = zstd::stream::read::Decoder::with_buffer(file)?;
         // The version comes first so an unsupported layout is reported, not misparsed.
-        let version: u32 = bincode::deserialize_from(&mut dec).context("not a Tea Telemetry capture file")?;
+        // Bounded the same as records: a corrupt length prefix here (e.g. a channel name)
+        // must not make bincode resize a buffer to match an attacker-chosen size.
+        let version: u32 = record_options().deserialize_from(&mut dec).context("not a Tea Telemetry capture file")?;
         if version > CAPTURE_VERSION {
             anyhow::bail!("capture was made by a newer version of Tea Telemetry");
         }
@@ -112,7 +114,7 @@ impl ReplaySource {
             anyhow::bail!("capture format version {version} is no longer supported; please record it again");
         }
         let (sim, channels): (Sim, Vec<String>) =
-            bincode::deserialize_from(&mut dec).context("not a Tea Telemetry capture file")?;
+            record_options().deserialize_from(&mut dec).context("not a Tea Telemetry capture file")?;
         let remap = ChannelRemap::new(&channels);
         let path_str = path.display().to_string();
         // A truncated capture (app killed while capturing) simply ends early.
@@ -268,23 +270,42 @@ mod tests {
         assert!(matches!(src.poll(), PollResult::NotConnected));
     }
 
+    /// bincode 1.3.3's `IoReader::fill_buffer` resizes a temp buffer to a String's or
+    /// `Vec<u8>`'s claimed length *before* reading it, guarded only by the size limit.
+    /// Unbounded, a lying length prefix there makes it try to allocate an amount of
+    /// memory no allocator can satisfy, which aborts the process (not a catchable panic)
+    /// rather than returning an error. These two tests hand-craft such a lie in the
+    /// header and in a record and check both come back as an ordinary `Err`/`NotConnected`.
     #[test]
-    fn a_record_with_a_huge_vec_length_is_rejected_not_allocated() {
+    fn huge_channel_name_length_in_the_header_is_rejected_not_allocated() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("huge.tcap");
+        let path = dir.path().join("huge-header.tcap");
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&CAPTURE_VERSION.to_le_bytes()); // version: u32
+        raw.extend_from_slice(&0u32.to_le_bytes()); // sim: Sim::Iracing
+        raw.extend_from_slice(&1u64.to_le_bytes()); // channels: Vec<String>, one entry
+        raw.extend_from_slice(&(1u64 << 62).to_le_bytes()); // that entry's String length: a lie
+        // No name bytes follow: the file simply doesn't have them.
+        let compressed = zstd::encode_all(raw.as_slice(), 3).unwrap();
+        std::fs::write(&path, compressed).unwrap();
+
+        assert!(ReplaySource::open(&path, false).is_err());
+    }
+
+    #[test]
+    fn huge_string_length_in_a_session_record_is_rejected_not_allocated() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("huge-session.tcap");
         let header = CaptureHeader { version: CAPTURE_VERSION, sim: Sim::Iracing, channels: channel_names() };
         let mut raw = Vec::new();
         bincode::serialize_into(&mut raw, &header).unwrap();
-        // A Frame record whose values Vec length prefix is far bigger than any real
-        // channel list (Channel::COUNT), well past the per-record cap.
-        let mut huge = Frame::new(1.0, 1);
-        huge.values = vec![0.0f32; 20_000_000]; // ~76 MiB, exceeds MAX_RECORD_BYTES
-        bincode::serialize_into(&mut raw, &PollResult::Frame(huge)).unwrap();
+        raw.extend_from_slice(&3u32.to_le_bytes()); // PollResult::Session variant index
+        raw.extend_from_slice(&0u32.to_le_bytes()); // SessionInfo.sim: Sim::Iracing
+        raw.extend_from_slice(&(1u64 << 62).to_le_bytes()); // SessionInfo.track_id length: a lie
         let compressed = zstd::encode_all(raw.as_slice(), 3).unwrap();
         std::fs::write(&path, compressed).unwrap();
 
         let mut src = ReplaySource::open(&path, false).unwrap();
-        // Rejected as corrupt, not delivered as a giant Frame, and no panic along the way.
         assert!(matches!(src.poll(), PollResult::NotConnected));
         assert!(matches!(src.poll(), PollResult::NotConnected));
     }

@@ -11,6 +11,10 @@ use std::time::{Duration, Instant};
 const WAIT_MS: u32 = 100;
 /// A connected sim that publishes no new tick for this long has crashed or hung.
 const STALE_AFTER: Duration = Duration::from_secs(10);
+/// SessionTime landing this far behind the last delivered frame (without a Session
+/// event) is a discontinuity, not a stall: e.g. a restart the sim didn't announce, or a
+/// scrubbed replay.
+const SESSION_TIME_DISCONTINUITY_S: f64 = 1.0;
 
 /// Read access to the sim's shared memory (real on Windows, fake in tests).
 pub trait SharedMem {
@@ -169,9 +173,14 @@ impl<M: SharedMem> Connection<M> {
             return Ok(PollResult::Idle);
         }
         // A tick with no forward progress in SessionTime (e.g. a rotated buffer while the
-        // sim itself is paused) isn't a new sample.
-        if self.last_frame_time_s.is_some_and(|last| frame.session_time_s <= last) {
-            return Ok(PollResult::Paused);
+        // sim itself is paused) isn't a new sample. But a big jump *backward* without a
+        // Session event (a restart the sim didn't announce, a scrubbed replay) is a
+        // discontinuity, not a stall: treat it as a fresh reference point and deliver it.
+        if let Some(last) = self.last_frame_time_s {
+            let behind = last - frame.session_time_s;
+            if behind <= SESSION_TIME_DISCONTINUITY_S && frame.session_time_s <= last {
+                return Ok(PollResult::Paused);
+            }
         }
         self.last_frame_time_s = Some(frame.session_time_s);
         Ok(PollResult::Frame(frame))
@@ -507,6 +516,29 @@ mod tests {
         rig.tick_stalled();
         let f = expect_frame(rig.src.poll());
         assert_eq!(f.session_time_s, 1234.6);
+    }
+
+    #[test]
+    fn large_backward_session_time_jump_is_a_discontinuity_not_paused() {
+        let mut rig = Rig::new();
+        rig.src.poll(); // Session
+        let f = expect_frame(rig.src.poll());
+        assert_eq!(f.session_time_s, 1234.5);
+        // A small step backward (well within a second) is still "no progress".
+        rig.b.set("SessionTime", 1234.0);
+        rig.tick_stalled();
+        assert!(matches!(rig.src.poll(), PollResult::Paused));
+        // A jump backward by more than a second, with no Session event announcing a
+        // restart, is a discontinuity: deliver the frame instead of holding it back.
+        rig.b.set("SessionTime", 10.0);
+        rig.tick_stalled();
+        let f = expect_frame(rig.src.poll());
+        assert_eq!(f.session_time_s, 10.0);
+        // The new reference point behaves normally: a small step backward from it is
+        // still just "no progress", not another discontinuity.
+        rig.b.set("SessionTime", 9.98);
+        rig.tick_stalled();
+        assert!(matches!(rig.src.poll(), PollResult::Paused));
     }
 
     #[test]
