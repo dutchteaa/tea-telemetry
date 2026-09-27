@@ -85,7 +85,8 @@ channels! {
 /// One telemetry sample, normalized across sims.
 ///
 /// `values` is indexed by [`Channel::index`] and always has [`Channel::COUNT`] entries;
-/// NaN means "this sim doesn't provide that channel".
+/// NaN means "this sim doesn't provide that channel". [`Frame::get`] also reads NaN past the end
+/// of `values`, so a malformed frame can't panic.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Frame {
     pub session_time_s: f64,
@@ -107,7 +108,7 @@ impl Frame {
     }
 
     pub fn get(&self, ch: Channel) -> f32 {
-        self.values[ch.index()]
+        self.values.get(ch.index()).copied().unwrap_or(f32::NAN)
     }
 
     pub fn set(&mut self, ch: Channel, v: f32) {
@@ -155,5 +156,13 @@ mod tests {
         assert_eq!(f.get(Channel::Throttle), 0.75);
         assert!(f.flag(Channel::OnPitRoad));
         assert!(!f.flag(Channel::OffTrack)); // NaN counts as false
+    }
+
+    #[test]
+    fn get_past_the_end_of_short_values_is_nan() {
+        let mut f = Frame::new(0.0, 1);
+        f.values.truncate(2);
+        assert!(f.get(Channel::AirTempC).is_nan());
+        assert!(!f.flag(Channel::OnPitRoad));
     }
 }

@@ -1,7 +1,14 @@
 //! Raw capture of adapter output, and a [`SimSource`] that plays it back.
 //! Used for tests, fixtures and the "mock sim" dev mode.
+//!
+//! A capture is `zstd(bincode(CaptureHeader), bincode(PollResult)*)`. Frames are stored
+//! in the channel order named by the header and remapped to the current
+//! [`Channel::ALL`] order on replay, so adding, removing or reordering channels keeps old
+//! captures readable. Any other change to how `PollResult`, `Frame` or `SessionInfo`
+//! serialize changes the format and must bump [`CAPTURE_VERSION`].
 
 use super::{PollResult, Sim, SimSource};
+use crate::frame::{Channel, Frame};
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use std::fs::File;
@@ -9,7 +16,8 @@ use std::io::{BufReader, BufWriter};
 use std::path::Path;
 use std::time::Duration;
 
-const CAPTURE_VERSION: u32 = 1;
+/// v1 (no channel list) captures were never kept, so they aren't supported.
+const CAPTURE_VERSION: u32 = 2;
 const MAX_REALTIME_GAP_S: f64 = 0.5;
 const NON_FRAME_DELAY: Duration = Duration::from_millis(16);
 
@@ -17,6 +25,12 @@ const NON_FRAME_DELAY: Duration = Duration::from_millis(16);
 struct CaptureHeader {
     version: u32,
     sim: Sim,
+    /// Channel names in the order of every Frame's `values` in this file.
+    channels: Vec<String>,
+}
+
+fn channel_names() -> Vec<String> {
+    Channel::ALL.iter().map(|c| c.name().to_string()).collect()
 }
 
 pub struct CaptureWriter {
@@ -27,13 +41,38 @@ impl CaptureWriter {
     pub fn create(path: &Path, sim: Sim) -> anyhow::Result<Self> {
         let file = BufWriter::new(File::create(path).with_context(|| format!("creating {}", path.display()))?);
         let mut enc = zstd::stream::write::Encoder::new(file, 3)?.auto_finish();
-        bincode::serialize_into(&mut enc, &CaptureHeader { version: CAPTURE_VERSION, sim })?;
+        let header = CaptureHeader { version: CAPTURE_VERSION, sim, channels: channel_names() };
+        bincode::serialize_into(&mut enc, &header)?;
         Ok(Self { enc })
     }
 
     pub fn write(&mut self, ev: &PollResult) -> anyhow::Result<()> {
         bincode::serialize_into(&mut self.enc, ev)?;
         Ok(())
+    }
+}
+
+/// Moves a capture's frame values into the current channel order.
+struct ChannelRemap {
+    /// For each channel index in the file, its index now (None: channel no longer exists).
+    targets: Vec<Option<usize>>,
+}
+
+impl ChannelRemap {
+    fn new(file_channels: &[String]) -> Self {
+        let targets = file_channels.iter().map(|n| Channel::from_name(n).map(Channel::index)).collect();
+        Self { targets }
+    }
+
+    fn apply(&self, ev: PollResult) -> PollResult {
+        let PollResult::Frame(f) = ev else { return ev };
+        let mut values = vec![f32::NAN; Channel::COUNT];
+        for (v, target) in f.values.iter().zip(&self.targets) {
+            if let Some(i) = target {
+                values[*i] = *v;
+            }
+        }
+        PollResult::Frame(Frame { values, ..f })
     }
 }
 
@@ -53,17 +92,23 @@ impl ReplaySource {
     pub fn open(path: &Path, realtime: bool) -> anyhow::Result<Self> {
         let file = BufReader::new(File::open(path).with_context(|| format!("opening {}", path.display()))?);
         let mut dec = zstd::stream::read::Decoder::with_buffer(file)?;
-        let header: CaptureHeader =
-            bincode::deserialize_from(&mut dec).context("not a Tea Telemetry capture file")?;
-        if header.version > CAPTURE_VERSION {
+        // The version comes first so an unsupported layout is reported, not misparsed.
+        let version: u32 = bincode::deserialize_from(&mut dec).context("not a Tea Telemetry capture file")?;
+        if version > CAPTURE_VERSION {
             anyhow::bail!("capture was made by a newer version of Tea Telemetry");
         }
+        if version < CAPTURE_VERSION {
+            anyhow::bail!("capture format version {version} is no longer supported; please record it again");
+        }
+        let (sim, channels): (Sim, Vec<String>) =
+            bincode::deserialize_from(&mut dec).context("not a Tea Telemetry capture file")?;
+        let remap = ChannelRemap::new(&channels);
         let path_str = path.display().to_string();
         // A truncated capture (app killed while capturing) simply ends early.
         // Other errors (corruption) are logged before ending.
         let events = std::iter::from_fn(move || {
             match bincode::deserialize_from::<_, PollResult>(&mut dec) {
-                Ok(ev) => Some(ev),
+                Ok(ev) => Some(remap.apply(ev)),
                 Err(e) => {
                     if !is_clean_end(&e) {
                         log::warn!("capture {}: stopped reading after a corrupt record: {}", path_str, e);
@@ -72,7 +117,7 @@ impl ReplaySource {
                 }
             }
         });
-        Ok(Self { sim: header.sim, events: Box::new(events), realtime, last_time_s: None })
+        Ok(Self { sim, events: Box::new(events), realtime, last_time_s: None })
     }
 
     pub fn from_events(sim: Sim, events: Vec<PollResult>, realtime: bool) -> Self {
@@ -193,7 +238,7 @@ mod tests {
 
         // Build raw uncompressed stream: bincode header + one valid event + corrupt bytes
         let mut raw = Vec::new();
-        let header = CaptureHeader { version: CAPTURE_VERSION, sim: Sim::Iracing };
+        let header = CaptureHeader { version: CAPTURE_VERSION, sim: Sim::Iracing, channels: channel_names() };
         bincode::serialize_into(&mut raw, &header).unwrap();
         bincode::serialize_into(&mut raw, &PollResult::Idle).unwrap();
         // Append 16 bytes of 0xFF to corrupt the next record
@@ -210,5 +255,51 @@ mod tests {
         assert!(matches!(src.poll(), PollResult::NotConnected));
         // Should not panic on further polls
         assert!(matches!(src.poll(), PollResult::NotConnected));
+    }
+
+    /// Write a capture by hand, as an older or differently-built app might have.
+    fn write_raw_capture(path: &Path, header: &impl Serialize, events: &[PollResult]) {
+        let mut raw = Vec::new();
+        bincode::serialize_into(&mut raw, header).unwrap();
+        for ev in events {
+            bincode::serialize_into(&mut raw, ev).unwrap();
+        }
+        std::fs::write(path, zstd::encode_all(raw.as_slice(), 3).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn frames_are_remapped_from_the_capture_channel_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("other-order.tcap");
+        let header = CaptureHeader {
+            version: CAPTURE_VERSION,
+            sim: Sim::Iracing,
+            channels: vec!["speed".into(), "retired_channel".into(), "lap_dist_pct".into()],
+        };
+        let mut f = Frame::new(12.5, 4);
+        f.values = vec![55.0, 9.0, 0.25];
+        write_raw_capture(&path, &header, &[PollResult::Frame(f)]);
+
+        let mut src = ReplaySource::open(&path, false).unwrap();
+        match src.poll() {
+            PollResult::Frame(f) => {
+                assert_eq!(f.values.len(), Channel::COUNT);
+                assert_eq!(f.get(Channel::SpeedMs), 55.0);
+                assert_eq!(f.get(Channel::LapDistPct), 0.25);
+                assert!(f.get(Channel::LapDistM).is_nan());
+                assert_eq!(Channel::ALL.iter().filter(|&&c| !f.get(c).is_nan()).count(), 2);
+                assert_eq!((f.session_time_s, f.lap), (12.5, 4));
+            }
+            other => panic!("expected Frame, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn version_1_captures_are_refused_clearly() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v1.tcap");
+        write_raw_capture(&path, &(1u32, Sim::Iracing), &[PollResult::Idle]);
+        let err = ReplaySource::open(&path, false).err().expect("v1 must be refused").to_string();
+        assert!(err.contains("version 1"), "{err}");
     }
 }
