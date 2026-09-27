@@ -1,5 +1,6 @@
 //! Sim adapters and the types they share.
 
+pub mod iracing;
 pub mod replay;
 
 use crate::frame::Frame;
