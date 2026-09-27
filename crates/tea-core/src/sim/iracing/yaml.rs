@@ -79,7 +79,35 @@ fn tokenize(src: &str) -> Vec<Line> {
         .collect()
 }
 
-fn parse_map(lines: &[Line], pos: &mut usize, indent: usize, mut item_head: bool) -> Vec<(String, Node)> {
+/// Caps recursion depth so a pathologically indented input (this comes from another
+/// process's shared memory) can't overflow the stack. iRacing's real session info
+/// nests at most ~5 levels deep, so this is far above anything legitimate.
+const MAX_DEPTH: usize = 32;
+
+/// Skip every line that belongs to the (uncaptured) child block of a key at `indent`:
+/// deeper map keys, or list items whose dash sits at or past `indent`. Leaves `*pos`
+/// at the next sibling/parent line, preserving the loop-progress guarantee that every
+/// caller relies on.
+fn skip_block(lines: &[Line], pos: &mut usize, indent: usize) {
+    while let Some(line) = lines.get(*pos) {
+        let is_child = match line.dash_indent {
+            Some(d) => d >= indent,
+            None => line.key_indent > indent,
+        };
+        if !is_child {
+            break;
+        }
+        *pos += 1;
+    }
+}
+
+fn parse_map(
+    lines: &[Line],
+    pos: &mut usize,
+    indent: usize,
+    mut item_head: bool,
+    depth: usize,
+) -> Vec<(String, Node)> {
     let mut entries = Vec::new();
     while let Some(line) = lines.get(*pos) {
         if item_head {
@@ -97,12 +125,22 @@ fn parse_map(lines: &[Line], pos: &mut usize, indent: usize, mut item_head: bool
         } else {
             match lines.get(*pos) {
                 Some(next) if next.dash_indent.is_some_and(|d| d >= indent) => {
-                    let d = next.dash_indent.expect("checked");
-                    Node::List(parse_list(lines, pos, d))
+                    if depth >= MAX_DEPTH {
+                        skip_block(lines, pos, indent);
+                        Node::Scalar(String::new())
+                    } else {
+                        let d = next.dash_indent.expect("checked");
+                        Node::List(parse_list(lines, pos, d, depth + 1))
+                    }
                 }
                 Some(next) if next.dash_indent.is_none() && next.key_indent > indent => {
-                    let child_indent = next.key_indent;
-                    Node::Map(parse_map(lines, pos, child_indent, false))
+                    if depth >= MAX_DEPTH {
+                        skip_block(lines, pos, indent);
+                        Node::Scalar(String::new())
+                    } else {
+                        let child_indent = next.key_indent;
+                        Node::Map(parse_map(lines, pos, child_indent, false, depth + 1))
+                    }
                 }
                 _ => Node::Scalar(String::new()),
             }
@@ -112,14 +150,14 @@ fn parse_map(lines: &[Line], pos: &mut usize, indent: usize, mut item_head: bool
     entries
 }
 
-fn parse_list(lines: &[Line], pos: &mut usize, dash_indent: usize) -> Vec<Node> {
+fn parse_list(lines: &[Line], pos: &mut usize, dash_indent: usize, depth: usize) -> Vec<Node> {
     let mut items = Vec::new();
     while let Some(line) = lines.get(*pos) {
         if line.dash_indent != Some(dash_indent) {
             break;
         }
         let key_indent = line.key_indent;
-        items.push(Node::Map(parse_map(lines, pos, key_indent, true)));
+        items.push(Node::Map(parse_map(lines, pos, key_indent, true, depth + 1)));
     }
     items
 }
@@ -133,7 +171,7 @@ pub fn parse(src: &str) -> Node {
         let before = pos;
         let indent = lines[pos].key_indent;
         let is_item_head = lines[pos].dash_indent.is_some();
-        root.extend(parse_map(&lines, &mut pos, indent, is_item_head));
+        root.extend(parse_map(&lines, &mut pos, indent, is_item_head, 0));
         if pos == before {
             pos += 1;
         }
@@ -298,5 +336,17 @@ mod tests {
         // Total garbage must not panic either.
         let _ = session_from_yaml("::::\n  - - -\n\t\u{0}", 0);
         let _ = parse("");
+    }
+
+    #[test]
+    fn deep_nesting_is_capped_not_a_stack_overflow() {
+        let mut s = String::new();
+        for i in 0..10_000 {
+            s.push_str(&" ".repeat(i));
+            s.push_str("k:\n");
+        }
+        s.push_str("Tail: yes\n");
+        let root = parse(&s);
+        assert_eq!(root.get("Tail").and_then(Node::str), Some("yes"));
     }
 }
