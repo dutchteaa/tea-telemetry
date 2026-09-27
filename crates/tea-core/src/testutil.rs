@@ -50,7 +50,6 @@ pub fn drive(start_lap: i32, start_pct: f64, duration_s: f64) -> Vec<Frame> {
 ///
 /// Not used by this crate's own tests yet; reserved for later tasks (store, recorder
 /// service) that reuse this fixture.
-#[allow(dead_code)]
 pub fn completed_lap() -> CompletedLap {
     let mut rec = Recorder::new();
     let mut events = vec![PollResult::Session(session())];

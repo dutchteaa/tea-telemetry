@@ -4,6 +4,7 @@ pub mod frame;
 pub mod laptime;
 pub mod recorder;
 pub mod sim;
+pub mod store;
 pub mod tlap;
 
 #[cfg(test)]
