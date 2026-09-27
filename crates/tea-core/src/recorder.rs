@@ -10,6 +10,9 @@ pub const SIM_LAP_TIME_WAIT_FRAMES: u32 = 90;
 const SIM_LAP_TIME_TOLERANCE_S: f64 = 1.0;
 /// A jump in lap_dist_pct bigger than this in one frame (without a line crossing) is a reset.
 const TELEPORT_PCT: f32 = 0.05;
+/// A lap in progress this long (60 Hz for 30 minutes) never crossed the line again and is
+/// abandoned, e.g. crossed into pit lane then sat in the stall.
+pub const MAX_LAP_SAMPLES: usize = 60 * 30 * 60;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InvalidReason {
@@ -80,17 +83,30 @@ struct PendingLap {
     frames_waited: u32,
 }
 
-#[derive(Default)]
 pub struct Recorder {
     session: Option<ActiveSession>,
     lap: Option<LapInProgress>,
     prev: Option<Frame>,
     pending: Option<PendingLap>,
+    max_lap_samples: usize,
+}
+
+impl Default for Recorder {
+    fn default() -> Self {
+        Self { session: None, lap: None, prev: None, pending: None, max_lap_samples: MAX_LAP_SAMPLES }
+    }
 }
 
 impl Recorder {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A `Recorder` with a lower lap-sample cap, so tests can exercise the cap without
+    /// generating tens of thousands of frames.
+    #[cfg(test)]
+    fn with_max_lap_samples(max_lap_samples: usize) -> Self {
+        Self { max_lap_samples, ..Self::default() }
     }
 
     pub fn current_lap(&self) -> Option<i32> {
@@ -162,6 +178,15 @@ impl Recorder {
                     }
                 }
                 lap.samples.push(f.clone());
+                if lap.samples.len() > self.max_lap_samples {
+                    log::debug!(
+                        "lap {}: {} samples exceeds the cap of {}; abandoning (stuck without crossing the line?)",
+                        lap.lap_number,
+                        lap.samples.len(),
+                        self.max_lap_samples
+                    );
+                    self.lap = None;
+                }
             }
             // First line crossing we've seen: a lap starts here.
             (None, Some(prev)) if f.lap == prev.lap + 1 => {
@@ -444,6 +469,15 @@ mod tests {
     fn frames_without_a_session_are_ignored() {
         let ev: Vec<PollResult> = drive(1, 0.5553, 160.0).into_iter().map(PollResult::Frame).collect();
         assert!(run(&mut Recorder::new(), ev).is_empty());
+    }
+
+    #[test]
+    fn caps_lap_growth_when_a_lap_never_crosses_the_line() {
+        // e.g. crossed the line into pit lane, then sat in the stall for a long time.
+        let mut rec = Recorder::with_max_lap_samples(5);
+        let laps = run(&mut rec, with_session(drive(1, 0.5553, 160.0), PollResult::Idle));
+        assert!(laps.is_empty(), "every lap exceeds the 5-sample cap before it can close");
+        assert!(!rec.is_recording());
     }
 
     #[test]
