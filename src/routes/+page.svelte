@@ -1,156 +1,119 @@
 <script lang="ts">
-  import { invoke } from "@tauri-apps/api/core";
+  import { invoke } from '@tauri-apps/api/core';
+  import { onMount } from 'svelte';
+  import { formatLapTime } from '$lib/format';
 
-  let name = $state("");
-  let greetMsg = $state("");
+  type RecorderStatus = {
+    state: 'no_sim' | 'idle' | 'recording';
+    sim: 'iracing' | 'lmu' | null;
+    lap: number | null;
+    laps_saved: number;
+    last_error: string | null;
+  };
 
-  async function greet(event: Event) {
-    event.preventDefault();
-    // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
-    greetMsg = await invoke("greet", { name });
+  type LapSummary = {
+    lap_id: string;
+    sim: string;
+    track_name: string;
+    track_config: string;
+    car_name: string;
+    session_type: string;
+    lap_number: number;
+    lap_time_ms: number;
+    valid: boolean;
+    invalid_reason: string | null;
+    fuel_used_l: number | null;
+    created_at_ms: number;
+  };
+
+  let status = $state<RecorderStatus | null>(null);
+  let laps = $state<LapSummary[]>([]);
+  let error = $state<string | null>(null);
+
+  const simName = (s: string | null) => (s === 'iracing' ? 'iRacing' : s === 'lmu' ? 'LMU' : '');
+
+  function statusText(s: RecorderStatus | null): string {
+    if (!s || s.state === 'no_sim') return 'No sim detected';
+    if (s.state === 'idle') return `${simName(s.sim)} · idle`;
+    return `${simName(s.sim)} · recording · Lap ${s.lap ?? '?'}`;
   }
+
+  async function refresh() {
+    try {
+      status = await invoke<RecorderStatus>('get_status');
+      laps = await invoke<LapSummary[]>('recent_laps', { limit: 50 });
+      error = null;
+    } catch (e) {
+      error = String(e);
+    }
+  }
+
+  onMount(() => {
+    refresh();
+    const id = setInterval(refresh, 1000);
+    return () => clearInterval(id);
+  });
 </script>
 
-<main class="container">
-  <h1>Welcome to Tauri + Svelte</h1>
+<main>
+  <header>
+    <h1>Tea Telemetry</h1>
+    <span class="pill" class:live={status?.state === 'recording'} class:idle={status?.state === 'idle'}>
+      {statusText(status)}
+    </span>
+  </header>
 
-  <div class="row">
-    <a href="https://vite.dev" target="_blank">
-      <img src="/vite.svg" class="logo vite" alt="Vite Logo" />
-    </a>
-    <a href="https://tauri.app" target="_blank">
-      <img src="/tauri.svg" class="logo tauri" alt="Tauri Logo" />
-    </a>
-    <a href="https://svelte.dev" target="_blank">
-      <img src="/svelte.svg" class="logo svelte-kit" alt="SvelteKit Logo" />
-    </a>
-  </div>
-  <p>Click on the Tauri, Vite, and SvelteKit logos to learn more.</p>
+  {#if status?.last_error}
+    <p class="error">Recorder: {status.last_error}</p>
+  {/if}
+  {#if error}
+    <p class="error">{error}</p>
+  {/if}
 
-  <form class="row" onsubmit={greet}>
-    <input id="greet-input" placeholder="Enter a name..." bind:value={name} />
-    <button type="submit">Greet</button>
-  </form>
-  <p>{greetMsg}</p>
+  <h2>Recent laps</h2>
+  {#if laps.length === 0}
+    <p class="muted">No laps yet. Start driving and completed laps will appear here.</p>
+  {:else}
+    <table>
+      <thead>
+        <tr><th>Track</th><th>Car</th><th>Session</th><th>Lap</th><th>Time</th><th>Fuel</th><th></th></tr>
+      </thead>
+      <tbody>
+        {#each laps as lap (lap.lap_id)}
+          <tr class:invalid={!lap.valid}>
+            <td>{lap.track_name}{lap.track_config ? ` · ${lap.track_config}` : ''}</td>
+            <td>{lap.car_name}</td>
+            <td>{lap.session_type}</td>
+            <td class="num">{lap.lap_number}</td>
+            <td class="num">{formatLapTime(lap.lap_time_ms)}</td>
+            <td class="num">{lap.fuel_used_l != null ? `${lap.fuel_used_l.toFixed(2)} L` : '–'}</td>
+            <td class="muted">{lap.valid ? '' : lap.invalid_reason?.replace('_', ' ')}</td>
+          </tr>
+        {/each}
+      </tbody>
+    </table>
+  {/if}
 </main>
 
 <style>
-.logo.vite:hover {
-  filter: drop-shadow(0 0 2em #747bff);
-}
-
-.logo.svelte-kit:hover {
-  filter: drop-shadow(0 0 2em #ff3e00);
-}
-
-:root {
-  font-family: Inter, Avenir, Helvetica, Arial, sans-serif;
-  font-size: 16px;
-  line-height: 24px;
-  font-weight: 400;
-
-  color: #0f0f0f;
-  background-color: #f6f6f6;
-
-  font-synthesis: none;
-  text-rendering: optimizeLegibility;
-  -webkit-font-smoothing: antialiased;
-  -moz-osx-font-smoothing: grayscale;
-  -webkit-text-size-adjust: 100%;
-}
-
-.container {
-  margin: 0;
-  padding-top: 10vh;
-  display: flex;
-  flex-direction: column;
-  justify-content: center;
-  text-align: center;
-}
-
-.logo {
-  height: 6em;
-  padding: 1.5em;
-  will-change: filter;
-  transition: 0.75s;
-}
-
-.logo.tauri:hover {
-  filter: drop-shadow(0 0 2em #24c8db);
-}
-
-.row {
-  display: flex;
-  justify-content: center;
-}
-
-a {
-  font-weight: 500;
-  color: #646cff;
-  text-decoration: inherit;
-}
-
-a:hover {
-  color: #535bf2;
-}
-
-h1 {
-  text-align: center;
-}
-
-input,
-button {
-  border-radius: 8px;
-  border: 1px solid transparent;
-  padding: 0.6em 1.2em;
-  font-size: 1em;
-  font-weight: 500;
-  font-family: inherit;
-  color: #0f0f0f;
-  background-color: #ffffff;
-  transition: border-color 0.25s;
-  box-shadow: 0 2px 2px rgba(0, 0, 0, 0.2);
-}
-
-button {
-  cursor: pointer;
-}
-
-button:hover {
-  border-color: #396cd8;
-}
-button:active {
-  border-color: #396cd8;
-  background-color: #e8e8e8;
-}
-
-input,
-button {
-  outline: none;
-}
-
-#greet-input {
-  margin-right: 5px;
-}
-
-@media (prefers-color-scheme: dark) {
-  :root {
-    color: #f6f6f6;
-    background-color: #2f2f2f;
+  :global(body) {
+    margin: 0;
+    background: #0e1116;
+    color: #c9d1d9;
+    font-family: 'Segoe UI', system-ui, sans-serif;
   }
-
-  a:hover {
-    color: #24c8db;
-  }
-
-  input,
-  button {
-    color: #ffffff;
-    background-color: #0f0f0f98;
-  }
-  button:active {
-    background-color: #0f0f0f69;
-  }
-}
-
+  main { padding: 20px 24px; }
+  header { display: flex; align-items: center; gap: 16px; }
+  h1 { font-size: 20px; margin: 0; }
+  h2 { font-size: 13px; text-transform: uppercase; letter-spacing: 0.06em; color: #6b7785; margin-top: 28px; }
+  .pill { padding: 4px 12px; border-radius: 999px; font-size: 12px; background: #1f2630; color: #8b949e; }
+  .pill.idle { background: rgba(56, 189, 248, 0.12); color: #38bdf8; }
+  .pill.live { background: rgba(74, 222, 128, 0.14); color: #4ade80; }
+  .error { color: #f87171; font-size: 13px; }
+  .muted { color: #6b7785; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th { text-align: left; color: #6b7785; font-weight: 600; padding: 6px 8px; border-bottom: 1px solid #1f2630; }
+  td { padding: 6px 8px; border-bottom: 1px solid #161b22; }
+  .num { font-variant-numeric: tabular-nums; }
+  tr.invalid td:not(.muted) { color: #6b7785; }
 </style>
