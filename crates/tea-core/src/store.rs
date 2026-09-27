@@ -118,7 +118,10 @@ impl Store {
         let rel: String = self
             .conn
             .query_row("SELECT file_path FROM laps WHERE id = ?1", [lap_id], |r| r.get(0))
-            .with_context(|| format!("lap {lap_id} not found"))?;
+            .map_err(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => anyhow::anyhow!("lap {lap_id} not found"),
+                e => anyhow::Error::new(e).context(format!("looking up lap {lap_id}")),
+            })?;
         let bytes = fs::read(self.root.join(rel))?;
         Ok(tlap::decode(&bytes)?)
     }
@@ -351,6 +354,23 @@ mod tests {
         let t = &file.data[0];
         assert!(t[0] < 0.0 && t[1] >= 0.0, "first boundary sample is before the line");
         assert_eq!(file.header.sector_times_ms, vec![30_000, 40_000, 30_000]);
+    }
+
+    #[test]
+    fn read_lap_file_reports_not_found_for_a_missing_lap() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let err = store.read_lap_file("no-such-lap").unwrap_err().to_string();
+        assert!(err.contains("lap no-such-lap not found"), "{err}");
+    }
+
+    #[test]
+    fn read_lap_file_propagates_other_errors_with_their_own_context() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        store.conn.execute("DROP TABLE laps", []).unwrap();
+        let err = store.read_lap_file("anything").unwrap_err().to_string();
+        assert!(!err.contains("not found"), "{err}");
     }
 
     #[test]

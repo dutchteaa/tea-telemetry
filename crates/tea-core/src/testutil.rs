@@ -47,9 +47,7 @@ pub fn drive(start_lap: i32, start_pct: f64, duration_s: f64) -> Vec<Frame> {
 }
 
 /// One clean 100 s lap (lap 2 of a Spa practice session) produced by the real recorder.
-///
-/// Not used by this crate's own tests yet; reserved for later tasks (store, recorder
-/// service) that reuse this fixture.
+/// Used by the `store` tests as a ready-made lap to save and read back.
 pub fn completed_lap() -> CompletedLap {
     let mut rec = Recorder::new();
     let mut events = vec![PollResult::Session(session())];
