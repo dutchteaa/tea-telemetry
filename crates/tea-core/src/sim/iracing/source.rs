@@ -47,6 +47,8 @@ struct Connection<M> {
     var_layout: Option<(i32, i32)>,
     /// Tick of the newest sample already delivered.
     last_tick: Option<i32>,
+    /// Session time of the newest Frame already delivered in the current session.
+    last_frame_time_s: Option<f64>,
     /// Newest tick in the header, and when we first saw it (for staleness).
     seen_tick: Option<i32>,
     seen_at: Instant,
@@ -69,6 +71,7 @@ impl<M: SharedMem> Connection<M> {
             vars: VarMap::default(),
             var_layout: None,
             last_tick: None,
+            last_frame_time_s: None,
             seen_tick: None,
             seen_at: now,
             frozen_tick,
@@ -157,6 +160,7 @@ impl<M: SharedMem> Connection<M> {
             if let Some(info) = self.on_session_info(parsed, control.session_num, header.session_info_update) {
                 // Re-read the newest sample on the next poll so it follows the Session.
                 self.last_tick = None;
+                self.last_frame_time_s = None;
                 return Ok(PollResult::Session(info));
             }
         }
@@ -164,6 +168,12 @@ impl<M: SharedMem> Connection<M> {
         if self.session_key.is_none() || control.is_replay || !control.is_on_track {
             return Ok(PollResult::Idle);
         }
+        // A tick with no forward progress in SessionTime (e.g. a rotated buffer while the
+        // sim itself is paused) isn't a new sample.
+        if self.last_frame_time_s.is_some_and(|last| frame.session_time_s <= last) {
+            return Ok(PollResult::Paused);
+        }
+        self.last_frame_time_s = Some(frame.session_time_s);
         Ok(PollResult::Frame(frame))
     }
 
@@ -331,6 +341,9 @@ mod tests {
         running: Rc<Cell<bool>>,
         hook: ReadHook,
         clock: Rc<Cell<Instant>>,
+        /// SessionTime as of the last `tick()`, to tell an explicit `set` from time that
+        /// simply hasn't been touched since.
+        last_session_time: f64,
     }
 
     impl Rig {
@@ -373,11 +386,26 @@ mod tests {
                 Some(dir) => src.with_raw_dump(dir),
                 None => src,
             };
-            Rig { src, b, img, running, hook, clock }
+            Rig { src, b, img, running, hook, clock, last_session_time: 1234.5 }
         }
 
-        /// Publish the builder's current state as a new tick.
+        /// Publish the builder's current state as a new tick, advancing SessionTime by a
+        /// realistic step unless the test already set a specific value for this tick.
         fn tick(&mut self) {
+            let current = self.b.get("SessionTime");
+            if current == self.last_session_time {
+                let advanced = current + 0.1;
+                self.b.set("SessionTime", advanced);
+                self.last_session_time = advanced;
+            } else {
+                self.last_session_time = current;
+            }
+            self.tick_stalled();
+        }
+
+        /// Publish a new tick without advancing SessionTime, as if the buffer rotated
+        /// while the sim itself made no progress.
+        fn tick_stalled(&mut self) {
             self.b.tick += 1;
             *self.img.borrow_mut() = self.b.build();
         }
@@ -460,6 +488,25 @@ mod tests {
         let f = expect_frame(rig.src.poll());
         assert_eq!(f.session_time_s, 1234.6);
         assert_eq!(f.sim_last_lap_time_s, Some(101.25));
+    }
+
+    #[test]
+    fn stalled_session_time_is_paused_despite_new_tick() {
+        let mut rig = Rig::new();
+        rig.src.poll(); // Session
+        expect_frame(rig.src.poll());
+        // A new tick is published (e.g. a rotated buffer) but SessionTime hasn't moved.
+        rig.tick_stalled();
+        assert!(matches!(rig.src.poll(), PollResult::Paused));
+        // Session time going backwards is treated the same way.
+        rig.b.set("SessionTime", 1234.4);
+        rig.tick_stalled();
+        assert!(matches!(rig.src.poll(), PollResult::Paused));
+        // Once it actually advances, frames resume.
+        rig.b.set("SessionTime", 1234.6);
+        rig.tick_stalled();
+        let f = expect_frame(rig.src.poll());
+        assert_eq!(f.session_time_s, 1234.6);
     }
 
     #[test]

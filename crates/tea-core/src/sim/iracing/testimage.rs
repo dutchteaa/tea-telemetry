@@ -38,6 +38,10 @@ impl ImageBuilder {
         self
     }
 
+    pub fn get(&self, name: &str) -> f64 {
+        self.values.get(name).copied().unwrap_or(0.0)
+    }
+
     pub fn build(&self) -> Vec<u8> {
         let num_vars = self.vars.len();
         let var_header_offset = HEADER_LEN;
