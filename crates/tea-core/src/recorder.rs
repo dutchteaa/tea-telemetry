@@ -73,11 +73,24 @@ struct LapInProgress {
     /// real wrap), or discovered by searching this lap's own early samples (the mirror
     /// case). `None` until then; `close_lap` falls back to a fresh local search.
     start_s: Option<f64>,
+    /// Whether this lap actually shares its start boundary with whatever's in
+    /// `Recorder::pending`: only true when it was opened by closing that exact lap (the
+    /// `f.lap == n + 1` transition). A lap opened by the "first crossing" arm (after a
+    /// jump/regression dropped the lap in progress, or after Idle/NotConnected/Session)
+    /// has no such relationship, even if its own early samples happen to reveal a wrap —
+    /// discovering one there must not touch an unrelated pending lap.
+    shares_boundary_with_pending: bool,
 }
 
 impl LapInProgress {
     fn starting(lap_number: i32, before_line: Frame, after_line: Frame) -> Self {
-        Self { lap_number, samples: vec![before_line, after_line], reset: false, start_s: None }
+        Self {
+            lap_number,
+            samples: vec![before_line, after_line],
+            reset: false,
+            start_s: None,
+            shares_boundary_with_pending: false,
+        }
     }
 }
 
@@ -174,6 +187,10 @@ impl Recorder {
                 self.try_resolve_pending(&f, out);
                 let mut new_lap = LapInProgress::starting(f.lap, prev, f.clone());
                 new_lap.start_s = end_crossing;
+                // This lap and whatever's now in `pending` share this exact boundary
+                // (closing this lap is what may have just populated `pending`), so a
+                // later self-discovered start is safe to back-correct it with.
+                new_lap.shares_boundary_with_pending = true;
                 self.lap = Some(new_lap);
             }
             // Lap counter jumped or went backwards: the session was reset. Drop the lap.
@@ -193,16 +210,27 @@ impl Recorder {
                 // Mirror case: Lap changed before LapDistPct wrapped, so the previous
                 // lap's own tail search found no wrap and used a rough fallback for its
                 // end. Once this lap's early samples reveal the real crossing, use it as
-                // this lap's start and fix up whatever's still waiting for the sim's
-                // official time (it shares this exact boundary).
-                if lap.start_s.is_none() && lap.samples.len() <= WRAP_SEARCH_PAIRS + 1 {
-                    let naive = line_crossing_time(&lap.samples[0], &lap.samples[1]);
-                    let discovered = lap_start_time(&lap.samples);
-                    if discovered != naive {
-                        lap.start_s = Some(discovered);
-                        if let Some(p) = self.pending.as_mut() {
-                            correct_pending_end(p, discovered);
+                // this lap's start, and — only if this lap actually shares its boundary
+                // with `pending` — fix up whatever's still waiting for the sim's official
+                // time. Otherwise (e.g. this lap started after a jump/regression dropped
+                // the previous one) `pending` holds some unrelated older lap and must be
+                // left alone even if a wrap does turn up here.
+                if lap.start_s.is_none() {
+                    if lap.samples.len() <= WRAP_SEARCH_PAIRS + 1 {
+                        let naive = line_crossing_time(&lap.samples[0], &lap.samples[1]);
+                        let discovered = lap_start_time(&lap.samples);
+                        if discovered != naive {
+                            lap.start_s = Some(discovered);
+                            if lap.shares_boundary_with_pending {
+                                if let Some(p) = self.pending.as_mut() {
+                                    correct_pending_end(p, discovered);
+                                }
+                            }
                         }
+                    } else {
+                        // The search window is over with nothing found: this lap can no
+                        // longer discover anything to back-correct `pending` with.
+                        lap.shares_boundary_with_pending = false;
                     }
                 }
                 if lap.samples.len() > self.max_lap_samples {
@@ -541,6 +569,42 @@ mod tests {
         assert!(laps.is_empty(), "one crossing starts tracking; it doesn't complete a lap yet");
         assert!(rec.is_recording());
         assert_eq!(rec.current_lap(), Some(2));
+    }
+
+    #[test]
+    fn early_bump_after_an_unrelated_drop_does_not_correct_the_pending_lap() {
+        // Lap 2 closes cleanly and sits in `pending`. Lap 3, which starts right after it,
+        // gets abandoned by a counter jump before it ever closes. A little later, well
+        // within lap 2's 90-frame wait, a completely unrelated crossing (an early-bumped
+        // 5 -> 6, structurally identical to the early-bump case above, just much shorter)
+        // must not be mistaken for sharing lap 2's start boundary and correct it.
+        let mut frames = drive(1, 0.5553, 144.5); // lap 2 closes cleanly at t=144.47
+        // The jump: right after lap 3 starts, force the counter to 5 (a +2 jump), which
+        // abandons lap 3 in progress.
+        let mut jump = Frame::new(T0 + 144.6, 5);
+        jump.set(Channel::LapDistPct, 0.05);
+        frames.push(jump);
+        // A short, unrelated lap 5 wrapping to 6, with the Lap counter bumped one frame
+        // early — same shape as `pct_wrap_a_frame_off_the_lap_increment_is_not_a_reset`'s
+        // early case, just shifted in time and much shorter so it fits well inside lap
+        // 2's 90-frame wait.
+        let mut tail = drive(5, 0.9553, 10.0);
+        for f in tail.iter_mut() {
+            f.session_time_s += 144.6;
+            if at(f, 144.6 + 4.35, 144.6 + 4.45) {
+                f.lap = 6;
+            }
+        }
+        frames.extend(tail);
+
+        let mut ev = vec![PollResult::Session(session())];
+        ev.extend(frames.into_iter().map(PollResult::Frame));
+        ev.push(PollResult::Idle);
+        let laps = run(&mut Recorder::new(), ev);
+
+        let lap2 = laps.iter().find(|l| l.lap_number == 2).expect("lap 2");
+        assert_eq!(lap2.lap_time_ms, 100_000, "an unrelated crossing must not touch lap 2");
+        assert_eq!(lap2.sector_times_ms, vec![30_000, 40_000, 30_000]);
     }
 
     #[test]
