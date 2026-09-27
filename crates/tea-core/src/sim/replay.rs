@@ -44,6 +44,11 @@ pub struct ReplaySource {
     last_time_s: Option<f64>,
 }
 
+/// A capture that simply ends (normal end, or truncated by a crash) reads as UnexpectedEof.
+fn is_clean_end(e: &bincode::Error) -> bool {
+    matches!(&**e, bincode::ErrorKind::Io(io) if io.kind() == std::io::ErrorKind::UnexpectedEof)
+}
+
 impl ReplaySource {
     pub fn open(path: &Path, realtime: bool) -> anyhow::Result<Self> {
         let file = BufReader::new(File::open(path).with_context(|| format!("opening {}", path.display()))?);
@@ -60,9 +65,7 @@ impl ReplaySource {
             match bincode::deserialize_from::<_, PollResult>(&mut dec) {
                 Ok(ev) => Some(ev),
                 Err(e) => {
-                    // Check if it's a clean EOF by looking at the error message
-                    let is_eof = e.to_string().contains("UnexpectedEof");
-                    if !is_eof {
+                    if !is_clean_end(&e) {
                         log::warn!("capture {}: stopped reading after a corrupt record: {}", path_str, e);
                     }
                     None
@@ -130,6 +133,21 @@ mod tests {
             }
             other => format!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn clean_end_is_not_reported_as_corruption() {
+        // Test that a real EOF error is recognized as clean
+        let err: bincode::Error = bincode::deserialize_from::<_, PollResult>(&mut &[][..]).unwrap_err();
+        assert!(is_clean_end(&err), "empty input should produce UnexpectedEof");
+
+        // Test that a corruption error is not recognized as clean
+        // Use invalid enum tag that produces a non-Io error
+        let mut invalid_data = Vec::new();
+        invalid_data.extend_from_slice(&9u32.to_le_bytes()); // Invalid enum variant
+        invalid_data.extend_from_slice(&[0u8; 12]); // Padding
+        let err: bincode::Error = bincode::deserialize_from::<_, PollResult>(&mut &invalid_data[..]).unwrap_err();
+        assert!(!is_clean_end(&err), "invalid enum tag should not be UnexpectedEof");
     }
 
     #[test]
