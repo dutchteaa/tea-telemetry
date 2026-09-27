@@ -161,8 +161,12 @@ impl Store {
             let path = entry?.path();
             let name = path.file_name().and_then(|n| n.to_str()).unwrap_or_default().to_string();
             if name.ends_with(".tlap.tmp") {
-                fs::remove_file(&path)?;
-                report.temp_removed += 1;
+                // A leftover we can't delete (e.g. locked by antivirus) is harmless; it
+                // must not stop the app from starting.
+                match fs::remove_file(&path) {
+                    Ok(()) => report.temp_removed += 1,
+                    Err(e) => log::warn!("{name}: couldn't remove leftover temp file: {e}"),
+                }
                 continue;
             }
             let Some(id) = name.strip_suffix(".tlap") else { continue };
@@ -385,6 +389,22 @@ mod tests {
         assert_eq!(report.missing, 1);
         assert!(!dir.path().join("laps/half-written.tlap.tmp").exists());
         assert!(store.recent_laps(10).unwrap().is_empty(), "missing laps are hidden");
+    }
+
+    #[test]
+    fn reconcile_survives_a_temp_file_it_cannot_remove() {
+        let dir = tempdir().unwrap();
+        let mut store = Store::open(dir.path()).unwrap();
+        let lap = completed_lap();
+        store.save_lap(&lap, 1).unwrap();
+        // remove_file fails on a directory, standing in for a locked file.
+        std::fs::create_dir(dir.path().join("laps/stuck.tlap.tmp")).unwrap();
+        std::fs::write(dir.path().join("laps/half-written.tlap.tmp"), b"partial").unwrap();
+
+        let report = store.reconcile().expect("one bad temp file must not fail startup");
+        assert_eq!(report.temp_removed, 1);
+        assert!(!dir.path().join("laps/half-written.tlap.tmp").exists());
+        assert_eq!(store.recent_laps(10).unwrap().len(), 1);
     }
 
     #[test]

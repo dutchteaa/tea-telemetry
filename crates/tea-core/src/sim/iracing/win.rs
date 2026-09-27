@@ -3,6 +3,11 @@
 use super::source::SharedMem;
 use std::ffi::c_void;
 
+// `MemoryBasicInformation` below is the x64 layout of MEMORY_BASIC_INFORMATION (32-bit
+// Windows has no PartitionId), and iRacing itself is x64-only.
+#[cfg(not(target_arch = "x86_64"))]
+compile_error!("the iRacing shared-memory reader only supports x86_64 Windows");
+
 type Handle = *mut c_void;
 
 const FILE_MAP_READ: u32 = 0x0004;
